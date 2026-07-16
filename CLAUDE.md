@@ -71,7 +71,12 @@ src/Pipes.Transport.Windows.pas  src/Pipes.Transport.Posix.pas
 src/Pipes.Client.pas             src/Pipes.Server.pas
 tests/Unit + tests/Integration (DUnit e fpcunit, layout espelhado do pascal-amqp-faa)
 samples/  docs/ARQUITETURA.md
+Pipes.groupproj (grupo Delphi) + Pipes.lpg (grupo Lazarus) na raiz
 ```
+
+Todo `.dproj`/`.lpi` novo (teste, sample) deve ser registrado nos DOIS grupos da
+raiz: `Pipes.groupproj` (Projects + Targets + CallTarget de Build/Clean/Make) e
+`Pipes.lpg` (Target com BuildModes), como no pascal-amqp-faa.
 
 ## Milestones e agente recomendado (economia de tokens)
 
