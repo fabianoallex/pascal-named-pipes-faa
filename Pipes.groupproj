@@ -6,6 +6,9 @@
         <Projects Include="tests\Unit\Pipes.UnitTests.dproj">
             <Dependencies/>
         </Projects>
+        <Projects Include="tests\Integration\Pipes.IntegrationTests.dproj">
+            <Dependencies/>
+        </Projects>
     </ItemGroup>
     <ProjectExtensions>
         <Borland.Personality>Default.Personality.12</Borland.Personality>
@@ -23,14 +26,23 @@
     <Target Name="Pipes_UnitTests:Make">
         <MSBuild Projects="tests\Unit\Pipes.UnitTests.dproj" Targets="Make"/>
     </Target>
+    <Target Name="Pipes_IntegrationTests">
+        <MSBuild Projects="tests\Integration\Pipes.IntegrationTests.dproj"/>
+    </Target>
+    <Target Name="Pipes_IntegrationTests:Clean">
+        <MSBuild Projects="tests\Integration\Pipes.IntegrationTests.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="Pipes_IntegrationTests:Make">
+        <MSBuild Projects="tests\Integration\Pipes.IntegrationTests.dproj" Targets="Make"/>
+    </Target>
     <Target Name="Build">
-        <CallTarget Targets="Pipes_UnitTests"/>
+        <CallTarget Targets="Pipes_UnitTests;Pipes_IntegrationTests"/>
     </Target>
     <Target Name="Clean">
-        <CallTarget Targets="Pipes_UnitTests:Clean"/>
+        <CallTarget Targets="Pipes_UnitTests:Clean;Pipes_IntegrationTests:Clean"/>
     </Target>
     <Target Name="Make">
-        <CallTarget Targets="Pipes_UnitTests:Make"/>
+        <CallTarget Targets="Pipes_UnitTests:Make;Pipes_IntegrationTests:Make"/>
     </Target>
     <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
 </Project>

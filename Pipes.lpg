@@ -7,6 +7,11 @@
           <Mode Name="Default"/>
         </BuildModes>
       </Target>
+      <Target FileName="tests\Integration\fpc\PipesIntegrationTestsFpc.lpi">
+        <BuildModes>
+          <Mode Name="Default"/>
+        </BuildModes>
+      </Target>
     </Targets>
   </ProjectGroup>
 </CONFIG>
