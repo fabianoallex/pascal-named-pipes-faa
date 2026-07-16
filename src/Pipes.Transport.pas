@@ -81,6 +81,9 @@ implementation
 {$IFDEF PIPES_WINDOWS}
 uses
   Pipes.Transport.Windows;
+{$ELSE}
+uses
+  Pipes.Transport.Posix;
 {$ENDIF}
 
 { TPipeEndpointStream }
@@ -131,7 +134,7 @@ begin
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeCreateListener(APipeName);
   {$ELSE}
-  raise EPipeError.Create('transporte POSIX (Unix Domain Socket) chega no milestone M4');
+  Result := PosixPipeCreateListener(APipeName);
   {$ENDIF}
 end;
 
@@ -140,7 +143,7 @@ begin
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeConnect(APipeName, ATimeoutMs);
   {$ELSE}
-  raise EPipeError.Create('transporte POSIX (Unix Domain Socket) chega no milestone M4');
+  Result := PosixPipeConnect(APipeName, ATimeoutMs);
   {$ENDIF}
 end;
 
