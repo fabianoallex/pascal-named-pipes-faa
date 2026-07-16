@@ -46,6 +46,13 @@ begin
   Assert.AreEqual(AExpected, Integer(AActual));
 end;
 
+// Idem para contagens: Length() e' NativeInt no Win64 e o AreEqual<T> generico
+// nao infere T com argumentos de tipos diferentes (E2532).
+procedure EqualInt(AExpected, AActual: Integer);
+begin
+  Assert.AreEqual(AExpected, AActual);
+end;
+
 function MakeBytes(const AValues: array of Byte): TBytes;
 var
   I: Integer;
@@ -89,7 +96,7 @@ var
 begin
   B := PipeEncodeFrame(TPipeFrame.Request(UInt64($1122334455667788),
     MakeBytes([$AA, $BB, $CC])));
-  Assert.AreEqual(23, Length(B));
+  EqualInt(23, Length(B));
   // magic 'NPF1'
   EqualByte(Ord('N'), B[0]);
   EqualByte(Ord('P'), B[1]);
@@ -131,7 +138,7 @@ begin
   LFrame := PipeReadFrame(FStream, 1024);
   Assert.IsTrue(LFrame.Kind = pfkMessage, 'kind devia ser pfkMessage');
   Assert.IsTrue(LFrame.CorrId = 0, 'corrId de msg devia ser 0');
-  Assert.AreEqual(5, Length(LFrame.Payload));
+  EqualInt(5, Length(LFrame.Payload));
   for I := 0 to 4 do
     EqualByte(I + 1, LFrame.Payload[I]);
 end;
@@ -165,7 +172,7 @@ begin
   FStream.Position := 0;
   LFrame := PipeReadFrame(FStream, 1024);
   Assert.IsTrue(LFrame.Kind = pfkMessage);
-  Assert.AreEqual(0, Length(LFrame.Payload));
+  EqualInt(0, Length(LFrame.Payload));
 end;
 
 procedure TPipeFramingTests.RoundTrip_MultiplosFramesEmSequencia;
@@ -180,18 +187,18 @@ begin
 
   LFrame := PipeReadFrame(FStream, 1024);
   Assert.IsTrue(LFrame.Kind = pfkMessage);
-  Assert.AreEqual(1, Length(LFrame.Payload));
+  EqualInt(1, Length(LFrame.Payload));
 
   LFrame := PipeReadFrame(FStream, 1024);
   Assert.IsTrue(LFrame.Kind = pfkRequest);
-  Assert.AreEqual(2, Length(LFrame.Payload));
+  EqualInt(2, Length(LFrame.Payload));
   EqualByte(20, LFrame.Payload[0]);
   EqualByte(21, LFrame.Payload[1]);
 
   LFrame := PipeReadFrame(FStream, 1024);
   Assert.IsTrue(LFrame.Kind = pfkReply);
   Assert.IsTrue(LFrame.CorrId = 7);
-  Assert.AreEqual(0, Length(LFrame.Payload));
+  EqualInt(0, Length(LFrame.Payload));
 end;
 
 procedure TPipeFramingTests.ReadFrame_MagicInvalido_Levanta;
