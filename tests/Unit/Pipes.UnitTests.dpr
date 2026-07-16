@@ -9,7 +9,10 @@ uses
   DUnitX.Loggers.Xml.NUnit,
   DUnitX.TestFramework,
   Pipes.Threading in '..\..\src\Pipes.Threading.pas',
-  Pipes.ThreadingTests in 'Pipes.ThreadingTests.pas';
+  Pipes.Types in '..\..\src\Pipes.Types.pas',
+  Pipes.Framing in '..\..\src\Pipes.Framing.pas',
+  Pipes.ThreadingTests in 'Pipes.ThreadingTests.pas',
+  Pipes.FramingTests in 'Pipes.FramingTests.pas';
 
 var
   runner: ITestRunner;

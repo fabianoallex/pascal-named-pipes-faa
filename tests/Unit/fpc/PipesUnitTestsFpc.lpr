@@ -20,11 +20,16 @@ uses
   Interfaces, Forms, GuiTestRunner,
   {$ENDIF}
   Classes, consoletestrunner, testregistry,
-  Pipes.ThreadingTests;
+  Pipes.ThreadingTests,
+  Pipes.FramingTests;
 
 var
   ConsoleApp: TTestRunner;
 begin
+  // Console FPC puro: DefaultSystemCodePage nao e' UTF-8 por padrao; garante
+  // que as conversoes string<->UTF-8 dos testes sejam lossless.
+  SetMultiByteConversionCodePage(CP_UTF8);
+
   {$IFDEF MSWINDOWS}
   if ParamCount = 0 then
   begin

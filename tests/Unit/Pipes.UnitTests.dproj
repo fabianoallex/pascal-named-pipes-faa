@@ -69,7 +69,10 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="..\..\src\Pipes.Threading.pas"/>
+        <DCCReference Include="..\..\src\Pipes.Types.pas"/>
+        <DCCReference Include="..\..\src\Pipes.Framing.pas"/>
         <DCCReference Include="Pipes.ThreadingTests.pas"/>
+        <DCCReference Include="Pipes.FramingTests.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
