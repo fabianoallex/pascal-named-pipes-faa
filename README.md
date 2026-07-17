@@ -113,6 +113,12 @@ Exceções: EPipeError > EPipeClosed | EPipeTimeout | EPipeProtocol
 - **ChatVcl** — chat com UI (VCL no Delphi, LCL no Lazarus, mesmo fonte): uma instância é o
   servidor-hub (retransmite via `Broadcast`), as outras são clientes. Vitrine do
   `pdmMainThread` (handlers mexem na UI direto) e do `AutoReconnect`.
+- **PdvDualScreen** (`Operador` + `Cliente`) — PDV de tela dupla: o operador lança itens e
+  pede a forma de pagamento; o cliente acompanha e responde. Mostra o padrão recomendado
+  para uso em produção: a UI de cada lado não fala `TBytes`/`TPipeConnectionId` diretamente,
+  só os tipos de domínio (`TPdvItem`, `TPdvFormaPagamento`) através de uma fachada
+  (`Pdv.OperadorChannel`/`Pdv.ClienteChannel`) que encapsula `TNamedPipeServer`/
+  `TNamedPipeClient` e o protocolo de mensagens (`Pdv.Protocolo.pas`).
 
 ## Testes
 
@@ -138,7 +144,7 @@ vazamento de handle/fd em quedas abruptas repetidas e correlação RPC sob conco
 src/                 biblioteca (Pipes.Types, Pipes.Framing, Pipes.Transport[.Windows|.Posix],
                      Pipes.Base, Pipes.Server, Pipes.Client, Pipes.Threading, pipes.inc)
 packages/            pipes_faa.lpk (pacote Lazarus)
-samples/             EchoServer, EchoClient, ChatVcl
+samples/             EchoServer, EchoClient, ChatVcl, PdvDualScreen (Operador + Cliente)
 tests/               Unit + Integration (DUnitX e FPCUnit, espelhados)
 docs/ARQUITETURA.md  arquitetura completa (wire format, ciclo de vida das threads, racional)
 Pipes.groupproj      grupo de projetos Delphi    Pipes.lpg  grupo Lazarus

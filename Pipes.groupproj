@@ -18,6 +18,12 @@
         <Projects Include="samples\ChatVcl\ChatVcl.dproj">
             <Dependencies/>
         </Projects>
+        <Projects Include="samples\PdvDualScreen\Operador\PdvOperador.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="samples\PdvDualScreen\Cliente\PdvCliente.dproj">
+            <Dependencies/>
+        </Projects>
     </ItemGroup>
     <ProjectExtensions>
         <Borland.Personality>Default.Personality.12</Borland.Personality>
@@ -71,14 +77,32 @@
     <Target Name="ChatVcl:Make">
         <MSBuild Projects="samples\ChatVcl\ChatVcl.dproj" Targets="Make"/>
     </Target>
+    <Target Name="PdvOperador">
+        <MSBuild Projects="samples\PdvDualScreen\Operador\PdvOperador.dproj"/>
+    </Target>
+    <Target Name="PdvOperador:Clean">
+        <MSBuild Projects="samples\PdvDualScreen\Operador\PdvOperador.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="PdvOperador:Make">
+        <MSBuild Projects="samples\PdvDualScreen\Operador\PdvOperador.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="PdvCliente">
+        <MSBuild Projects="samples\PdvDualScreen\Cliente\PdvCliente.dproj"/>
+    </Target>
+    <Target Name="PdvCliente:Clean">
+        <MSBuild Projects="samples\PdvDualScreen\Cliente\PdvCliente.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="PdvCliente:Make">
+        <MSBuild Projects="samples\PdvDualScreen\Cliente\PdvCliente.dproj" Targets="Make"/>
+    </Target>
     <Target Name="Build">
-        <CallTarget Targets="Pipes_UnitTests;Pipes_IntegrationTests;EchoServer;EchoClient;ChatVcl"/>
+        <CallTarget Targets="Pipes_UnitTests;Pipes_IntegrationTests;EchoServer;EchoClient;ChatVcl;PdvOperador;PdvCliente"/>
     </Target>
     <Target Name="Clean">
-        <CallTarget Targets="Pipes_UnitTests:Clean;Pipes_IntegrationTests:Clean;EchoServer:Clean;EchoClient:Clean;ChatVcl:Clean"/>
+        <CallTarget Targets="Pipes_UnitTests:Clean;Pipes_IntegrationTests:Clean;EchoServer:Clean;EchoClient:Clean;ChatVcl:Clean;PdvOperador:Clean;PdvCliente:Clean"/>
     </Target>
     <Target Name="Make">
-        <CallTarget Targets="Pipes_UnitTests:Make;Pipes_IntegrationTests:Make;EchoServer:Make;EchoClient:Make;ChatVcl:Make"/>
+        <CallTarget Targets="Pipes_UnitTests:Make;Pipes_IntegrationTests:Make;EchoServer:Make;EchoClient:Make;ChatVcl:Make;PdvOperador:Make;PdvCliente:Make"/>
     </Target>
     <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
 </Project>
