@@ -197,6 +197,19 @@ function pipe_bind(ASocket: TSocket; AAddr: Pointer;
 function pipe_connect(ASocket: TSocket; AAddr: Pointer;
   ANameLen: Integer): Integer; stdcall; external 'ws2_32.dll' name 'connect';
 
+type
+  { Layout fixo do WSANETWORKEVENTS (FD_MAX_EVENTS = 10). Declarado aqui pelo
+    mesmo motivo dos demais: o FPC recebe o parametro como ponteiro e o Delphi
+    como 'var', o que nao compila nos dois com uma unica chamada. }
+  TPipeNetworkEvents = record
+    lNetworkEvents: LongInt;
+    iErrorCode: array[0..9] of Integer;
+  end;
+
+function pipe_WSAEnumNetworkEvents(ASocket: TSocket; AEvent: THandle;
+  AEvents: Pointer): Integer; stdcall;
+  external 'ws2_32.dll' name 'WSAEnumNetworkEvents';
+
 var
   GWinsockReady: Boolean = False;
 
@@ -271,7 +284,7 @@ end;
 procedure TPipeTcpWinEndpoint.WaitReadyOrStop(const AOp: string);
 var
   LEvents: array[0..1] of WSAEVENT;
-  LNet: TWSANetworkEvents;
+  LNet: TPipeNetworkEvents;
   LRc: DWORD;
 begin
   if PipeAtomicGet(FClosed) <> 0 then
@@ -289,7 +302,7 @@ begin
   // Reseta FSockEvent e consome os eventos pendentes; sem isso o evento fica
   // sinalizado e a proxima espera nao bloquearia.
   FillChar(LNet, SizeOf(LNet), 0);
-  WSAEnumNetworkEvents(FSocket, FSockEvent, @LNet);
+  pipe_WSAEnumNetworkEvents(FSocket, FSockEvent, @LNet);
   // Erro concreto (ex.: FD_CLOSE com erro) fica para o recv/send seguinte
   // reportar: ainda pode haver dado enfileirado para ler depois do FD_CLOSE.
 end;
@@ -377,7 +390,7 @@ end;
 function TPipeTcpWinListener.Accept: TPipeEndpoint;
 var
   LEvents: array[0..1] of WSAEVENT;
-  LNet: TWSANetworkEvents;
+  LNet: TPipeNetworkEvents;
   LRc: DWORD;
   LConn: TSocket;
   LErr: Integer;
@@ -408,7 +421,7 @@ begin
     if (LRc = PIPE_WSA_WAIT_EVENT_0 + 1) or (PipeAtomicGet(FClosed) <> 0) then
       Exit; // Close: devolve nil
     FillChar(LNet, SizeOf(LNet), 0);
-    WSAEnumNetworkEvents(FSocket, FAcceptEvent, @LNet);
+    pipe_WSAEnumNetworkEvents(FSocket, FAcceptEvent, @LNet);
   end;
 end;
 
@@ -472,7 +485,7 @@ function ConnectCandidate(ACand: PPipeAddrInfo; ADeadline: UInt64;
 var
   LSock: TSocket;
   LEvent: WSAEVENT;
-  LNet: TWSANetworkEvents;
+  LNet: TPipeNetworkEvents;
   LRemaining: Int64;
   LRc: DWORD;
 begin
@@ -520,7 +533,7 @@ begin
       Exit;
     end;
     FillChar(LNet, SizeOf(LNet), 0);
-    if WSAEnumNetworkEvents(LSock, LEvent, @LNet) <> 0 then
+    if pipe_WSAEnumNetworkEvents(LSock, LEvent, @LNet) <> 0 then
     begin
       AErr := WSAGetLastError;
       closesocket(LSock);
@@ -740,6 +753,11 @@ end;
 {$ENDIF}
 
 {$IFDEF PIPES_WINDOWS}
+initialization
+  // Vazia de proposito: o Delphi so aceita 'finalization' se houver
+  // 'initialization' (o FPC aceita a secao sozinha). O WSAStartup fica em
+  // EnsureWinsock, para nao cobrar Winsock de quem so usa ptLocal.
+
 finalization
   if GWinsockReady then
     WSACleanup;
