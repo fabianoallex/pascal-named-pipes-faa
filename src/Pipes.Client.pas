@@ -72,7 +72,8 @@ type
   protected
     function GetActive: Boolean; override;
   public
-    constructor Create(const AAddress: string);
+    constructor Create(const AAddress: string;
+      ATransport: TPipeTransport = ptLocal);
     destructor Destroy; override;
     /// Conecta (re-tentando ate ATimeoutMs; EPipeTimeout no prazo). Se havia
     /// uma sessao anterior (viva ou morta), e' encerrada antes.
@@ -220,9 +221,10 @@ end;
 
 { TPipeClient }
 
-constructor TPipeClient.Create(const AAddress: string);
+constructor TPipeClient.Create(const AAddress: string;
+  ATransport: TPipeTransport);
 begin
-  inherited Create(AAddress);
+  inherited Create(AAddress, ATransport);
   FWriteLock := TCriticalSection.Create;
   FRpcLock := TCriticalSection.Create;
   FRpcSlots := TDictionary<UInt64, TObject>.Create;
@@ -259,7 +261,7 @@ begin
   Disconnect; // encerra/limpa sessao anterior (viva ou morta); idempotente
   SetupDispatch;
   try
-    FEndpoint := PipeConnect(Address, ATimeoutMs);
+    FEndpoint := PipeConnect(Address, ATimeoutMs, Transport);
   except
     TeardownDispatch;
     raise;
@@ -326,7 +328,7 @@ begin
   try
     // O proprio PipeConnect re-tenta ate ReconnectDelayMs: e' o espacamento
     // entre tentativas (nao ha Sleep adicional).
-    LEndpoint := PipeConnect(Address, FReconnectDelayMs);
+    LEndpoint := PipeConnect(Address, FReconnectDelayMs, Transport);
   except
     on EPipeError do
       Exit; // inclui EPipeTimeout: proxima tentativa (ou desiste no teto)

@@ -1,0 +1,216 @@
+unit Pipes.TransportTests;
+
+{$mode delphi}{$H+}
+
+{ Testes do parsing de endereco TCP (PipeParseHostPort) e da validacao de
+  coerencia entre Address e Transport (PipeValidateAddress), ambos em
+  Pipes.Transport. Versao FPCUnit; espelha a cobertura da versao DUnitX em
+  tests/Unit. }
+
+interface
+
+uses
+  fpcunit, testregistry,
+  SysUtils,
+  Pipes.Types,
+  Pipes.Transport;
+
+type
+  TPipeTransportTests = class(TTestCase)
+  private
+    FAddress: string;
+    FTransport: TPipeTransport;
+    procedure DoParse;
+    procedure DoValidate;
+    /// Afirma que AAddress e' parseado em AHost/APort.
+    procedure CheckHostPort(const AAddress, AHost: string; APort: Word);
+    /// Afirma que AAddress e' recusado por PipeParseHostPort.
+    procedure CheckParseFails(const AAddress: string);
+    /// Afirma que o par (AAddress, ATransport) e' recusado.
+    procedure CheckInvalid(const AAddress: string; ATransport: TPipeTransport);
+    /// Afirma que o par (AAddress, ATransport) e' aceito.
+    procedure CheckValid(const AAddress: string; ATransport: TPipeTransport);
+  published
+    procedure ParseHostPort_IPv4;
+    procedure ParseHostPort_NomeDeHost;
+    procedure ParseHostPort_PortasLimite;
+    procedure ParseHostPort_AsteriscoViraTodasAsInterfaces;
+    procedure ParseHostPort_IPv6EntreColchetes;
+    procedure ParseHostPort_SemPorta_Levanta;
+    procedure ParseHostPort_PortaNaoNumerica_Levanta;
+    procedure ParseHostPort_PortaForaDaFaixa_Levanta;
+    procedure ParseHostPort_SemHost_Levanta;
+    procedure ParseHostPort_Vazio_Levanta;
+    procedure ParseHostPort_IPv6SemColchete_Levanta;
+    procedure ParseHostPort_IPv6SemPorta_Levanta;
+    procedure Validate_LocalAceitaNomeSimplesECaminhoNativo;
+    procedure Validate_TcpAceitaHostPorta;
+    procedure Validate_TcpRecusaCaminhoDePipeWindows;
+    procedure Validate_TcpRecusaCaminhoDeSocketPosix;
+    procedure Validate_TcpRecusaEnderecoMalformado;
+    procedure Validate_AddressVazio_Levanta;
+  end;
+
+implementation
+
+{ TPipeTransportTests }
+
+procedure TPipeTransportTests.DoParse;
+var
+  LHost: string;
+  LPort: Word;
+begin
+  PipeParseHostPort(FAddress, LHost, LPort);
+end;
+
+procedure TPipeTransportTests.DoValidate;
+begin
+  PipeValidateAddress(FAddress, FTransport);
+end;
+
+procedure TPipeTransportTests.CheckHostPort(const AAddress, AHost: string;
+  APort: Word);
+var
+  LHost: string;
+  LPort: Word;
+begin
+  PipeParseHostPort(AAddress, LHost, LPort);
+  AssertEquals('host de ' + AAddress, AHost, LHost);
+  AssertEquals('porta de ' + AAddress, Integer(APort), Integer(LPort));
+end;
+
+procedure TPipeTransportTests.CheckParseFails(const AAddress: string);
+begin
+  FAddress := AAddress;
+  AssertException('deveria recusar "' + AAddress + '"', EPipeError, DoParse);
+end;
+
+procedure TPipeTransportTests.CheckInvalid(const AAddress: string;
+  ATransport: TPipeTransport);
+begin
+  FAddress := AAddress;
+  FTransport := ATransport;
+  AssertException('deveria recusar "' + AAddress + '"', EPipeError, DoValidate);
+end;
+
+procedure TPipeTransportTests.CheckValid(const AAddress: string;
+  ATransport: TPipeTransport);
+begin
+  PipeValidateAddress(AAddress, ATransport); // nao deve levantar
+  AssertTrue('"' + AAddress + '" deveria ser aceito', True);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_IPv4;
+begin
+  CheckHostPort('127.0.0.1:5000', '127.0.0.1', 5000);
+  CheckHostPort('0.0.0.0:8080', '0.0.0.0', 8080);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_NomeDeHost;
+begin
+  CheckHostPort('localhost:5000', 'localhost', 5000);
+  CheckHostPort('servidor.local:15672', 'servidor.local', 15672);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_PortasLimite;
+begin
+  CheckHostPort('localhost:1', 'localhost', 1);
+  CheckHostPort('localhost:65535', 'localhost', 65535);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_AsteriscoViraTodasAsInterfaces;
+begin
+  CheckHostPort('*:5000', '0.0.0.0', 5000);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_IPv6EntreColchetes;
+begin
+  // O separador de porta e' o ':' depois do ']' — o host tem ':' de sobra.
+  CheckHostPort('[::1]:5000', '::1', 5000);
+  CheckHostPort('[fe80::1]:80', 'fe80::1', 80);
+end;
+
+procedure TPipeTransportTests.ParseHostPort_SemPorta_Levanta;
+begin
+  CheckParseFails('localhost');
+  CheckParseFails('127.0.0.1');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_PortaNaoNumerica_Levanta;
+begin
+  CheckParseFails('localhost:abc');
+  CheckParseFails('localhost:');
+  CheckParseFails('localhost:50a0');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_PortaForaDaFaixa_Levanta;
+begin
+  CheckParseFails('localhost:0');      // 0 nao e' porta utilizavel
+  CheckParseFails('localhost:65536');
+  CheckParseFails('localhost:-1');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_SemHost_Levanta;
+begin
+  CheckParseFails(':5000');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_Vazio_Levanta;
+begin
+  CheckParseFails('');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_IPv6SemColchete_Levanta;
+begin
+  CheckParseFails('[::1:5000');
+end;
+
+procedure TPipeTransportTests.ParseHostPort_IPv6SemPorta_Levanta;
+begin
+  CheckParseFails('[::1]');
+  CheckParseFails('[::1]5000'); // falta o ':'
+end;
+
+procedure TPipeTransportTests.Validate_LocalAceitaNomeSimplesECaminhoNativo;
+begin
+  CheckValid('MeuPipe', ptLocal);
+  CheckValid('\\.\pipe\MeuPipe', ptLocal);
+  CheckValid('/tmp/meu.sock', ptLocal);
+  // Um endereco host:porta nao e' proibido em ptLocal: seria um nome de pipe
+  // esquisito, mas valido — a validacao nao tenta adivinhar a intencao.
+  CheckValid('127.0.0.1:5000', ptLocal);
+end;
+
+procedure TPipeTransportTests.Validate_TcpAceitaHostPorta;
+begin
+  CheckValid('0.0.0.0:5000', ptTcp);
+  CheckValid('[::1]:5000', ptTcp);
+  CheckValid('*:5000', ptTcp);
+end;
+
+procedure TPipeTransportTests.Validate_TcpRecusaCaminhoDePipeWindows;
+begin
+  CheckInvalid('\\.\pipe\MeuPipe', ptTcp);
+end;
+
+procedure TPipeTransportTests.Validate_TcpRecusaCaminhoDeSocketPosix;
+begin
+  CheckInvalid('/tmp/meu.sock', ptTcp);
+end;
+
+procedure TPipeTransportTests.Validate_TcpRecusaEnderecoMalformado;
+begin
+  CheckInvalid('MeuPipe', ptTcp);        // sem porta
+  CheckInvalid('localhost:abc', ptTcp);  // porta nao numerica
+end;
+
+procedure TPipeTransportTests.Validate_AddressVazio_Levanta;
+begin
+  CheckInvalid('', ptLocal);
+  CheckInvalid('', ptTcp);
+end;
+
+initialization
+  RegisterTest(TPipeTransportTests);
+
+end.

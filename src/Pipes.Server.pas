@@ -102,7 +102,8 @@ type
   protected
     function GetActive: Boolean; override;
   public
-    constructor Create(const AAddress: string);
+    constructor Create(const AAddress: string;
+      ATransport: TPipeTransport = ptLocal);
     destructor Destroy; override;
     /// Nao-blocante: cria o listener e sobe a acceptor thread.
     procedure Listen;
@@ -317,9 +318,10 @@ end;
 
 { TPipeServer }
 
-constructor TPipeServer.Create(const AAddress: string);
+constructor TPipeServer.Create(const AAddress: string;
+  ATransport: TPipeTransport);
 begin
-  inherited Create(AAddress);
+  inherited Create(AAddress, ATransport);
   FConnections := TDictionary<TPipeConnectionId, TPipeServerConnection>.Create;
   FConnLock := TCriticalSection.Create;
 end;
@@ -346,7 +348,7 @@ begin
     raise EPipeError.Create('servidor ja esta ativo');
   SetupDispatch;
   try
-    FListener := PipeCreateListener(Address);
+    FListener := PipeCreateListener(Address, Transport);
   except
     TeardownDispatch;
     raise;

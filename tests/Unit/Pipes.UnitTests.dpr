@@ -12,7 +12,10 @@ uses
   Pipes.Types in '..\..\src\Pipes.Types.pas',
   Pipes.Framing in '..\..\src\Pipes.Framing.pas',
   Pipes.ThreadingTests in 'Pipes.ThreadingTests.pas',
-  Pipes.FramingTests in 'Pipes.FramingTests.pas';
+  Pipes.FramingTests in 'Pipes.FramingTests.pas',
+  Pipes.Transport in '..\..\src\Pipes.Transport.pas',
+  Pipes.Transport.Windows in '..\..\src\Pipes.Transport.Windows.pas',
+  Pipes.TransportTests in 'Pipes.TransportTests.pas';
 
 var
   runner: ITestRunner;

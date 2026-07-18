@@ -63,18 +63,33 @@ type
 
 // --- Fabricas por plataforma -------------------------------------------------
 
-/// Cria o ponto de escuta do servidor para o nome dado (ja deixa a primeira
+/// Cria o ponto de escuta do servidor para o endereco dado (ja deixa a primeira
 /// instancia/socket pronta: um cliente pode conectar antes do primeiro Accept).
-function PipeCreateListener(const AAddress: string): TPipeListener;
+function PipeCreateListener(const AAddress: string;
+  ATransport: TPipeTransport = ptLocal): TPipeListener;
 
 /// Conecta ao servidor, re-tentando ate ATimeoutMs (cobre servidor ainda nao
 /// iniciado e instancias momentaneamente ocupadas). EPipeTimeout no prazo.
-function PipeConnect(const AAddress: string; ATimeoutMs: Cardinal): TPipeEndpoint;
+function PipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
+  ATransport: TPipeTransport = ptLocal): TPipeEndpoint;
 
 /// Nome nativo do pipe: '\\.\pipe\<nome>' no Windows, '/tmp/<nome>.sock' no
 /// POSIX. Se AAddress ja for um caminho nativo ('\\...' ou '/...'), e' usado
-/// como esta (permite controlar o diretorio do socket no Linux).
+/// como esta (permite controlar o diretorio do socket no Linux). So faz
+/// sentido para ptLocal.
 function PipeNativeName(const AAddress: string): string;
+
+/// Quebra 'host:porta' em partes. Aceita IPv6 entre colchetes ('[::1]:5000')
+/// e '*' como atalho de '0.0.0.0'. EPipeError se malformado. So faz sentido
+/// para ptTcp.
+procedure PipeParseHostPort(const AAddress: string; out AHost: string;
+  out APort: Word);
+
+/// Garante que AAddress e' plausivel para ATransport; EPipeError com mensagem
+/// util caso contrario (ex.: Create('\\.\pipe\X', ptTcp) falha aqui, e nao
+/// mais tarde num erro obscuro de resolucao de nome).
+procedure PipeValidateAddress(const AAddress: string;
+  ATransport: TPipeTransport);
 
 implementation
 
@@ -129,8 +144,76 @@ begin
   {$ENDIF}
 end;
 
-function PipeCreateListener(const AAddress: string): TPipeListener;
+procedure PipeParseHostPort(const AAddress: string; out AHost: string;
+  out APort: Word);
+var
+  LSep, LPortVal, LErr: Integer;
+  LPortStr: string;
 begin
+  AHost := '';
+  APort := 0;
+  if AAddress = '' then
+    raise EPipeError.Create('endereco vazio');
+  if AAddress[1] = '[' then
+  begin
+    // IPv6 literal: o separador e' o ':' DEPOIS do ']', pois o proprio
+    // endereco esta cheio de ':'.
+    LSep := Pos(']', AAddress);
+    if LSep = 0 then
+      raise EPipeError.CreateFmt('endereco IPv6 sem "]": %s', [AAddress]);
+    AHost := Copy(AAddress, 2, LSep - 2);
+    if (Length(AAddress) <= LSep) or (AAddress[LSep + 1] <> ':') then
+      raise EPipeError.CreateFmt('endereco sem porta: %s', [AAddress]);
+    LPortStr := Copy(AAddress, LSep + 2, MaxInt);
+  end
+  else
+  begin
+    LSep := LastDelimiter(':', AAddress);
+    if LSep = 0 then
+      raise EPipeError.CreateFmt(
+        'endereco sem porta: %s (esperado "host:porta")', [AAddress]);
+    AHost := Copy(AAddress, 1, LSep - 1);
+    LPortStr := Copy(AAddress, LSep + 1, MaxInt);
+  end;
+  if AHost = '' then
+    raise EPipeError.CreateFmt('endereco sem host: %s', [AAddress]);
+  if AHost = '*' then
+    AHost := '0.0.0.0'; // atalho para "escutar em todas as interfaces"
+  Val(LPortStr, LPortVal, LErr);
+  if (LErr <> 0) or (LPortVal < 1) or (LPortVal > 65535) then
+    raise EPipeError.CreateFmt('porta invalida em %s: "%s" (1..65535)',
+      [AAddress, LPortStr]);
+  APort := Word(LPortVal);
+end;
+
+procedure PipeValidateAddress(const AAddress: string;
+  ATransport: TPipeTransport);
+var
+  LHost: string;
+  LPort: Word;
+begin
+  if AAddress = '' then
+    raise EPipeError.Create('Address vazio');
+  case ATransport of
+    ptLocal:
+      ; // qualquer nome/caminho serve; PipeNativeName resolve
+    ptTcp:
+      begin
+        if (Pos('\\', AAddress) = 1) or (AAddress[1] = '/') then
+          raise EPipeError.CreateFmt(
+            'Address "%s" e um caminho local, incompativel com ptTcp ' +
+            '(esperado "host:porta")', [AAddress]);
+        PipeParseHostPort(AAddress, LHost, LPort); // valida o formato
+      end;
+  end;
+end;
+
+function PipeCreateListener(const AAddress: string;
+  ATransport: TPipeTransport): TPipeListener;
+begin
+  PipeValidateAddress(AAddress, ATransport);
+  if ATransport = ptTcp then
+    raise EPipeError.Create('transporte ptTcp ainda nao implementado');
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeCreateListener(AAddress);
   {$ELSE}
@@ -138,8 +221,12 @@ begin
   {$ENDIF}
 end;
 
-function PipeConnect(const AAddress: string; ATimeoutMs: Cardinal): TPipeEndpoint;
+function PipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
+  ATransport: TPipeTransport): TPipeEndpoint;
 begin
+  PipeValidateAddress(AAddress, ATransport);
+  if ATransport = ptTcp then
+    raise EPipeError.Create('transporte ptTcp ainda nao implementado');
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeConnect(AAddress, ATimeoutMs);
   {$ELSE}

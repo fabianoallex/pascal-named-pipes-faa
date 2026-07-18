@@ -53,6 +53,7 @@ type
   TPipeBase = class
   private
     FAddress: string;
+    FTransport: TPipeTransport;
     FDispatchMode: TPipeDispatchMode;
     FMaxMessageSize: Cardinal;
     FOnMessage: TPipeMessageEvent;
@@ -61,6 +62,7 @@ type
     FInFlight: Integer;             // work items despachados em execucao (atomico)
     FGuard: TPipeGuard;             // guarda dos eventos pdmMainThread
     procedure SetAddress(const AValue: string);
+    procedure SetTransport(AValue: TPipeTransport);
     procedure SetDispatchMode(AValue: TPipeDispatchMode);
     procedure SetMaxMessageSize(AValue: Cardinal);
   protected
@@ -85,11 +87,15 @@ type
       AConnId: TPipeConnectionId);
     procedure DispatchError(AConnId: TPipeConnectionId; const AMsg: string);
   public
-    constructor Create(const AAddress: string);
+    constructor Create(const AAddress: string;
+      ATransport: TPipeTransport = ptLocal);
     destructor Destroy; override;
-    /// Endereco do ponto de comunicacao. Para o transporte local e' o nome do
-    /// pipe ('MeuPipe') ou um caminho nativo ('\\.\pipe\X', '/tmp/x.sock').
+    /// Endereco do ponto de comunicacao. Para ptLocal e' o nome do pipe
+    /// ('MeuPipe') ou um caminho nativo ('\\.\pipe\X', '/tmp/x.sock'); para
+    /// ptTcp e' 'host:porta'.
     property Address: string read FAddress write SetAddress;
+    /// Transporte que carrega os frames (ptLocal por padrao).
+    property Transport: TPipeTransport read FTransport write SetTransport;
     /// Compatibilidade com a API anterior a generalizacao do transporte.
     /// Mesmo campo de Address; sera marcada deprecated apos a migracao de
     /// samples e testes.
@@ -294,10 +300,12 @@ end;
 
 { TPipeBase }
 
-constructor TPipeBase.Create(const AAddress: string);
+constructor TPipeBase.Create(const AAddress: string;
+  ATransport: TPipeTransport);
 begin
   inherited Create;
   FAddress := AAddress; // direto no campo: GetActive e' abstrato aqui
+  FTransport := ATransport;
   FDispatchMode := pdmPool;
   FMaxMessageSize := PIPES_DEFAULT_MAX_MESSAGE_SIZE;
   FGuard := TPipeGuard.Create;
@@ -322,6 +330,12 @@ procedure TPipeBase.SetAddress(const AValue: string);
 begin
   EnsureInactive('Address');
   FAddress := AValue;
+end;
+
+procedure TPipeBase.SetTransport(AValue: TPipeTransport);
+begin
+  EnsureInactive('Transport');
+  FTransport := AValue;
 end;
 
 procedure TPipeBase.SetDispatchMode(AValue: TPipeDispatchMode);

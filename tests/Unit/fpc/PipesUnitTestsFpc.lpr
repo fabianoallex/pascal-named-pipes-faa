@@ -21,7 +21,8 @@ uses
   {$ENDIF}
   Classes, consoletestrunner, testregistry,
   Pipes.ThreadingTests,
-  Pipes.FramingTests;
+  Pipes.FramingTests,
+  Pipes.TransportTests;
 
 var
   ConsoleApp: TTestRunner;

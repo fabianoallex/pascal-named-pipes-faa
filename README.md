@@ -38,6 +38,33 @@ FIFOs (`mkfifo`) ficaram fora da v1; a camada de transporte abstrata deixa a por
 Se `Address` já for um caminho nativo (`\\.\pipe\...` ou `/caminho/abs.sock`), ele é usado
 como está — útil para controlar o diretório (e as permissões) do socket no Linux.
 
+### Transporte
+
+A property `Transport` (`TPipeTransport`) escolhe por onde os frames trafegam. O padrão é
+`ptLocal`, então quem só faz IPC local não precisa saber que isso existe:
+
+```pascal
+TPipeServer.Create('meu_app');                  // ptLocal (padrão)
+TPipeServer.Create('meu_app', ptLocal);         // idem, explícito
+TPipeServer.Create('0.0.0.0:5000', ptTcp);      // TCP — ainda não implementado
+```
+
+O enum nomeia **alcance**, não mecanismo: `ptLocal` é "o melhor IPC local deste SO" —
+Named Pipe no Windows, Unix Domain Socket no Linux. Um `ptNamedPipe` seria um nome errado
+metade das vezes.
+
+`Address` e `Transport` são validados juntos na ativação: `Create('\\.\pipe\X', ptTcp)`
+falha com `EPipeError` explicando o conflito, em vez de estourar mais tarde num erro
+obscuro de resolução de nome.
+
+> **Status:** `ptTcp` ainda **não está implementado** — `Listen`/`Connect` levantam
+> `EPipeError`. O enum, a validação e o parsing de `host:porta` (incluindo IPv6 entre
+> colchetes e `*` como atalho de `0.0.0.0`) já estão no lugar; falta o backend.
+>
+> Quando existir, `ptTcp` **não** herda controle de acesso do SO como `ptLocal` (ACL do
+> Windows, permissão de arquivo do UDS): o listener fica exposto à rede e a autenticação
+> passa a ser responsabilidade da aplicação.
+
 As mensagens trafegam num framing próprio (`NPF1`: header de 20 bytes little-endian com
 magic, kind, correlation id e length), idêntico nos dois SOs — fronteiras de mensagem são
 da biblioteca, nunca do transporte. Payloads são `TBytes`; os métodos `*Text` convertem
@@ -88,7 +115,7 @@ requisitos do seu projeto (ou use `lazbuild --add-package-link packages\pipes_fa
 
 ```pascal
 TPipeBase (abstrata)
-  Address, Active, DispatchMode, MaxMessageSize
+  Address, Transport, Active, DispatchMode, MaxMessageSize
   OnMessage: TPipeMessageEvent;  OnError: TPipeErrorEvent
 
 TPipeServer

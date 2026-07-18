@@ -28,6 +28,17 @@ type
       mensagens, pois os eventos nunca seriam drenados). }
   TPipeDispatchMode = (pdmPool, pdmSerialized, pdmMainThread);
 
+  { Qual transporte carrega os frames. Nomeado por ALCANCE, nao por mecanismo:
+    - ptLocal: o melhor IPC local do SO (padrao). Named Pipe no Windows, Unix
+      Domain Socket no POSIX — por isso 'ptNamedPipe' seria um nome errado
+      metade das vezes. Address e' o nome do pipe ('MeuPipe') ou um caminho
+      nativo ('\\.\pipe\X', '/tmp/x.sock').
+    - ptTcp: socket TCP, identico nas duas plataformas. Address e' 'host:porta'
+      ('0.0.0.0:5000', '127.0.0.1:5000', '[::1]:5000').
+    Diferente de ptLocal, ptTcp NAO herda controle de acesso do SO: o listener
+    fica exposto a rede e a autenticacao e' responsabilidade da aplicacao. }
+  TPipeTransport = (ptLocal, ptTcp);
+
   TPipeMessageEvent = procedure(Sender: TObject; AConnId: TPipeConnectionId;
     const AData: TBytes) of object;
   /// Request-reply no servidor: o retorno em AReply vira o frame de resposta
