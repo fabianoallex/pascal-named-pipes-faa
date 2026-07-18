@@ -65,7 +65,12 @@ type
     FStopW: cint;     // self-pipe: lado de escrita (Close escreve 1 byte)
     FClosed: Integer; // atomico
   public
+    /// Cria o socket AF_UNIX a partir do nome/caminho (bind + listen).
     constructor Create(const AAddress: string);
+    /// Assume a posse de um socket JA em listen (usado pelo transporte TCP,
+    /// que monta o socket AF_INET/AF_INET6 por conta propria). ANativePath
+    /// vazio = nao ha arquivo de socket para remover no destructor.
+    constructor CreateFromFd(AFd: cint; const ANativePath: string);
     destructor Destroy; override;
     function Accept: TPipeEndpoint; override;
     procedure Close; override;
@@ -253,6 +258,17 @@ begin
     RaiseIoError(Format('bind(%s)', [FNativePath]), fpgeterrno);
   if fpListen(FFd, PIPE_LISTEN_BACKLOG) <> 0 then
     RaiseIoError(Format('listen(%s)', [FNativePath]), fpgeterrno);
+end;
+
+constructor TPipePosixListener.CreateFromFd(AFd: cint;
+  const ANativePath: string);
+begin
+  inherited Create;
+  FFd := AFd;
+  FStopR := -1;
+  FStopW := -1;
+  FNativePath := ANativePath;
+  NewSelfPipe(FStopR, FStopW); // se falhar, o destructor fecha AFd
 end;
 
 destructor TPipePosixListener.Destroy;

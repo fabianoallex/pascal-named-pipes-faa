@@ -46,6 +46,10 @@
         <UnitName Value="Pipes.Transport.Posix"/>
       </Item>
       <Item>
+        <Filename Value="..\src\Pipes.Transport.Tcp.pas"/>
+        <UnitName Value="Pipes.Transport.Tcp"/>
+      </Item>
+      <Item>
         <Filename Value="..\src\Pipes.Base.pas"/>
         <UnitName Value="Pipes.Base"/>
       </Item>

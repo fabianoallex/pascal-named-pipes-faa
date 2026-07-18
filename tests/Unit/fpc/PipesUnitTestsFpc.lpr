@@ -22,7 +22,7 @@ uses
   Classes, consoletestrunner, testregistry,
   Pipes.ThreadingTests,
   Pipes.FramingTests,
-  Pipes.TransportTests;
+  Pipes.AddressTests;
 
 var
   ConsoleApp: TTestRunner;

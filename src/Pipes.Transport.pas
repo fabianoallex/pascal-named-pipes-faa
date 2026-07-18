@@ -93,11 +93,11 @@ procedure PipeValidateAddress(const AAddress: string;
 
 implementation
 
-{$IFDEF PIPES_WINDOWS}
 uses
+  Pipes.Transport.Tcp,
+{$IFDEF PIPES_WINDOWS}
   Pipes.Transport.Windows;
 {$ELSE}
-uses
   Pipes.Transport.Posix;
 {$ENDIF}
 
@@ -213,7 +213,7 @@ function PipeCreateListener(const AAddress: string;
 begin
   PipeValidateAddress(AAddress, ATransport);
   if ATransport = ptTcp then
-    raise EPipeError.Create('transporte ptTcp ainda nao implementado');
+    Exit(TcpPipeCreateListener(AAddress));
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeCreateListener(AAddress);
   {$ELSE}
@@ -226,7 +226,7 @@ function PipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
 begin
   PipeValidateAddress(AAddress, ATransport);
   if ATransport = ptTcp then
-    raise EPipeError.Create('transporte ptTcp ainda nao implementado');
+    Exit(TcpPipeConnect(AAddress, ATimeoutMs));
   {$IFDEF PIPES_WINDOWS}
   Result := WinPipeConnect(AAddress, ATimeoutMs);
   {$ELSE}

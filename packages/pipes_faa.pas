@@ -9,8 +9,8 @@ interface
 
 uses
   Pipes.Threading, Pipes.Types, Pipes.Framing, Pipes.Transport, 
-  Pipes.Transport.Windows, Pipes.Transport.Posix, Pipes.Base, Pipes.Server, 
-  Pipes.Client;
+  Pipes.Transport.Windows, Pipes.Transport.Posix, Pipes.Transport.Tcp, 
+  Pipes.Base, Pipes.Server, Pipes.Client;
 
 implementation
 

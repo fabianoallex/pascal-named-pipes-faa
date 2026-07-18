@@ -46,7 +46,8 @@ A property `Transport` (`TPipeTransport`) escolhe por onde os frames trafegam. O
 ```pascal
 TPipeServer.Create('meu_app');                  // ptLocal (padrão)
 TPipeServer.Create('meu_app', ptLocal);         // idem, explícito
-TPipeServer.Create('0.0.0.0:5000', ptTcp);      // TCP — ainda não implementado
+TPipeServer.Create('0.0.0.0:5000', ptTcp);      // TCP
+TPipeClient.Create('192.168.0.10:5000', ptTcp);
 ```
 
 O enum nomeia **alcance**, não mecanismo: `ptLocal` é "o melhor IPC local deste SO" —
@@ -57,13 +58,18 @@ metade das vezes.
 falha com `EPipeError` explicando o conflito, em vez de estourar mais tarde num erro
 obscuro de resolução de nome.
 
-> **Status:** `ptTcp` ainda **não está implementado** — `Listen`/`Connect` levantam
-> `EPipeError`. O enum, a validação e o parsing de `host:porta` (incluindo IPv6 entre
-> colchetes e `*` como atalho de `0.0.0.0`) já estão no lugar; falta o backend.
->
-> Quando existir, `ptTcp` **não** herda controle de acesso do SO como `ptLocal` (ACL do
-> Windows, permissão de arquivo do UDS): o listener fica exposto à rede e a autenticação
-> passa a ser responsabilidade da aplicação.
+Endereços aceitos por `ptTcp`: `host:porta`, IPv6 entre colchetes (`[::1]:5000`) e `*`
+como atalho de `0.0.0.0`. A resolução é via `getaddrinfo`, então nome de host e IPv6
+funcionam. `TCP_NODELAY` é ligado (o atraso do Nagle penalizaria muito `Request`/`Reply`).
+
+> **Segurança:** diferente de `ptLocal`, `ptTcp` **não** herda controle de acesso do SO
+> (ACL do Windows, permissão de arquivo do UDS). Um listener em `0.0.0.0` aceita qualquer
+> um que alcance a porta — autenticar é responsabilidade da aplicação.
+
+> **Ainda não implementado para rede:** keepalive/heartbeat. Uma conexão TCP pode morrer
+> em silêncio (cabo, NAT timeout) sem que nenhum dos lados perceba; hoje o reader ficaria
+> esperando indefinidamente. Em IPC local isso não acontecia, porque a queda do processo
+> par sempre fecha o pipe. Se você depende de detectar peer morto, trate na aplicação.
 
 As mensagens trafegam num framing próprio (`NPF1`: header de 20 bytes little-endian com
 magic, kind, correlation id e length), idêntico nos dois SOs — fronteiras de mensagem são

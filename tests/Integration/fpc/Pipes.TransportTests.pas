@@ -31,6 +31,11 @@ type
     procedure DoConnectInexistente;
   protected
     procedure TearDown; override;
+    // Parametrizam o fixture por transporte: a descendente TCP so troca estes
+    // tres, e herda os testes publicados abaixo.
+    function TestAddress: string; virtual;
+    function MissingAddress: string; virtual;
+    function TestTransport: TPipeTransport; virtual;
   published
     procedure Loopback_EnviaERecebeNosDoisSentidos;
     procedure Loopback_FrameNpf1FimAFim;
@@ -39,6 +44,17 @@ type
     procedure Read_DetectaQuedaDoPar;
     procedure Connect_TimeoutQuandoServidorNaoExiste;
     procedure MultiplosClientes_CadaUmComSeuEndpoint;
+  end;
+
+  { Mesma bateria sobre ptTcp (loopback 127.0.0.1). Exercita o backend
+    Pipes.Transport.Tcp: no Windows, a espera Winsock com WSAEventSelect; no
+    POSIX, o socket AF_INET reaproveitando o endpoint/listener de
+    Pipes.Transport.Posix. }
+  TPipeTcpTransportTests = class(TPipeTransportTests)
+  protected
+    function TestAddress: string; override;
+    function MissingAddress: string; override;
+    function TestTransport: TPipeTransport; override;
   end;
 
 implementation
@@ -140,16 +156,31 @@ begin
   inherited;
 end;
 
+function TPipeTransportTests.TestAddress: string;
+begin
+  Result := UniquePipeName;
+end;
+
+function TPipeTransportTests.MissingAddress: string;
+begin
+  Result := 'pipes_faa_teste_inexistente_xq';
+end;
+
+function TPipeTransportTests.TestTransport: TPipeTransport;
+begin
+  Result := ptLocal;
+end;
+
 procedure TPipeTransportTests.OpenLoopback;
 var
   LName: string;
   LAcc: TAcceptThread;
 begin
-  LName := UniquePipeName;
-  FListener := PipeCreateListener(LName);
+  LName := TestAddress;
+  FListener := PipeCreateListener(LName, TestTransport);
   LAcc := TAcceptThread.Create(FListener, 1);
   try
-    FClientEp := PipeConnect(LName, 3000);
+    FClientEp := PipeConnect(LName, 3000, TestTransport);
     LAcc.WaitFor;
     FServerEp := LAcc.Accepted(0);
   finally
@@ -160,7 +191,28 @@ end;
 
 procedure TPipeTransportTests.DoConnectInexistente;
 begin
-  FClientEp := PipeConnect('pipes_faa_teste_inexistente_xq', 300);
+  FClientEp := PipeConnect(MissingAddress, 300, TestTransport);
+end;
+
+{ TPipeTcpTransportTests }
+
+function TPipeTcpTransportTests.TestAddress: string;
+begin
+  // Porta nova a cada teste: evita TIME_WAIT barrar o rebind (no Windows o
+  // listener nao usa SO_REUSEADDR, de proposito). A base varia por execucao
+  // para nao colidir com uma rodada anterior ainda drenando.
+  Result := '127.0.0.1:' +
+    IntToStr(40000 + (Int64(PipeTickMs) mod 20000) + PipeAtomicInc(GNameSeq));
+end;
+
+function TPipeTcpTransportTests.MissingAddress: string;
+begin
+  Result := '127.0.0.1:1'; // porta reservada, ninguem escuta
+end;
+
+function TPipeTcpTransportTests.TestTransport: TPipeTransport;
+begin
+  Result := ptTcp;
 end;
 
 procedure TPipeTransportTests.Loopback_EnviaERecebeNosDoisSentidos;
@@ -331,5 +383,6 @@ end;
 
 initialization
   RegisterTest(TPipeTransportTests);
+  RegisterTest(TPipeTcpTransportTests);
 
 end.

@@ -15,7 +15,8 @@ uses
   Pipes.FramingTests in 'Pipes.FramingTests.pas',
   Pipes.Transport in '..\..\src\Pipes.Transport.pas',
   Pipes.Transport.Windows in '..\..\src\Pipes.Transport.Windows.pas',
-  Pipes.TransportTests in 'Pipes.TransportTests.pas';
+  Pipes.Transport.Tcp in '..\..\src\Pipes.Transport.Tcp.pas',
+  Pipes.AddressTests in 'Pipes.AddressTests.pas';
 
 var
   runner: ITestRunner;

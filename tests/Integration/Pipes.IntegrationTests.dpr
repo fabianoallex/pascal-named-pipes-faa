@@ -13,6 +13,7 @@ uses
   Pipes.Framing in '..\..\src\Pipes.Framing.pas',
   Pipes.Transport in '..\..\src\Pipes.Transport.pas',
   Pipes.Transport.Windows in '..\..\src\Pipes.Transport.Windows.pas',
+  Pipes.Transport.Tcp in '..\..\src\Pipes.Transport.Tcp.pas',
   Pipes.Base in '..\..\src\Pipes.Base.pas',
   Pipes.Server in '..\..\src\Pipes.Server.pas',
   Pipes.Client in '..\..\src\Pipes.Client.pas',
