@@ -82,6 +82,10 @@ type
     procedure FillPlain;               // decifra até haver plaintext (ou EOF)
     procedure ShutdownTls;
   public
+    /// Uso interno (o FPC avisa sobre construtor protegido, dai ser publico):
+    /// inicializa campos SEM negociar. O lado servidor usa isto porque negocia
+    /// depois, na reader thread da conexao.
+    constructor CreateDeferred(AUnderlying: TStream);
     constructor Create(AUnderlying: TStream; const ATargetName: string;
       AVerifyPeer: Boolean);
     destructor Destroy; override;
@@ -89,6 +93,36 @@ type
     function Write(const Buffer; Count: Longint): Longint; override;
     function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
   end;
+
+  { Stream TLS SERVIDOR. Difere do cliente em dois pontos:
+
+    - a credencial e' INBOUND e carrega um certificado (o cliente valida o
+      servidor; sem certificado nao ha o que apresentar);
+    - o handshake e' AcceptSecurityContext, e o servidor NUNCA fala primeiro:
+      espera o ClientHello antes da primeira chamada.
+
+    A negociacao NAO acontece no construtor: quem a dispara e' Negotiate,
+    chamada pela reader thread da conexao (ver TPipeEndpoint.Handshake). Fazer
+    isso no accept prenderia o loop de accept inteiro num cliente lento. }
+  TPipeSchannelServerStream = class(TPipeSchannelStream)
+  private
+    FCertContext: Pointer; // PCCERT_CONTEXT; a POSSE fica com o chamador
+    FNegotiated: Boolean;
+    procedure AcquireServerCred;
+    procedure DoServerHandshake;
+  public
+    /// ACertContext continua sendo do chamador: varias conexoes compartilham
+    /// o mesmo certificado do servidor, entao esta classe nao o libera.
+    constructor Create(AUnderlying: TStream; ACertContext: Pointer);
+    /// Idempotente. Levanta EPipeTls se a negociacao falhar.
+    procedure Negotiate;
+  end;
+
+/// Carrega um certificado de servidor (com chave privada) de um arquivo PFX.
+/// O contexto devolvido e' do CHAMADOR: liberar com PipeSchannelFreeCert.
+function PipeSchannelLoadPfx(const AFileName, APassword: string): Pointer;
+/// Libera o que PipeSchannelLoadPfx devolveu. Aceita nil.
+procedure PipeSchannelFreeCert(ACertContext: Pointer);
 
 {$ENDIF PIPES_WINDOWS}
 
@@ -149,6 +183,7 @@ const
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
 
   SECPKG_CRED_OUTBOUND     = 2;
+  SECPKG_CRED_INBOUND      = 1;
   SECURITY_NATIVE_DREP     = $10;
   SECBUFFER_VERSION        = 0;
   SCHANNEL_CRED_VERSION    = 4;
@@ -194,6 +229,52 @@ const
   HANDSHAKE_REQ = ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
     ISC_REQ_CONFIDENTIALITY or ISC_REQ_EXTENDED_ERROR or ISC_REQ_ALLOCATE_MEMORY or
     ISC_REQ_STREAM;
+
+  // Flags de AcceptSecurityContext (servidor, modo stream). Espelham as do
+  // cliente: mesma familia ASC_*, mesmos valores.
+  ASC_REQ_REPLAY_DETECT    = $00000004;
+  ASC_REQ_SEQUENCE_DETECT  = $00000008;
+  ASC_REQ_CONFIDENTIALITY  = $00000010;
+  ASC_REQ_EXTENDED_ERROR   = $00008000;
+  ASC_REQ_ALLOCATE_MEMORY  = $00000100;
+  ASC_REQ_STREAM           = $00010000;
+
+  ACCEPT_REQ = ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or
+    ASC_REQ_CONFIDENTIALITY or ASC_REQ_EXTENDED_ERROR or ASC_REQ_ALLOCATE_MEMORY or
+    ASC_REQ_STREAM;
+
+  // crypt32: carga do PFX
+  X509_ASN_ENCODING        = 1;
+  PKCS_7_ASN_ENCODING      = $10000;
+  CRYPT_EXPORTABLE         = 1;
+  CERT_KEY_PROV_INFO_PROP_ID = 2;
+
+type
+  TCryptDataBlob = record
+    cbData: DWORD;
+    pbData: Pointer;
+  end;
+
+function AcceptSecurityContext(phCredential: PCredHandle;
+  phContext: PCtxtHandle; pInput: PSecBufferDesc; fContextReq: ULONG;
+  TargetDataRep: ULONG; phNewContext: PCtxtHandle; pOutput: PSecBufferDesc;
+  pfContextAttr: PULONG; ptsTimeStamp: PSecTimeStamp): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'AcceptSecurityContext';
+
+function PFXImportCertStore(pPFX: Pointer; szPassword: PWideChar;
+  dwFlags: DWORD): THandle; stdcall; external 'crypt32.dll' name 'PFXImportCertStore';
+function CertEnumCertificatesInStore(hCertStore: THandle;
+  pPrev: Pointer): Pointer; stdcall;
+  external 'crypt32.dll' name 'CertEnumCertificatesInStore';
+function CertGetCertificateContextProperty(pCertContext: Pointer;
+  dwPropId: DWORD; pvData: Pointer; var pcbData: DWORD): BOOL; stdcall;
+  external 'crypt32.dll' name 'CertGetCertificateContextProperty';
+function CertDuplicateCertificateContext(pCertContext: Pointer): Pointer;
+  stdcall; external 'crypt32.dll' name 'CertDuplicateCertificateContext';
+function CertFreeCertificateContext(pCertContext: Pointer): BOOL; stdcall;
+  external 'crypt32.dll' name 'CertFreeCertificateContext';
+function CertCloseStore(hCertStore: THandle; dwFlags: DWORD): BOOL; stdcall;
+  external 'crypt32.dll' name 'CertCloseStore';
 
 function AcquireCredentialsHandleW(pszPrincipal, pszPackage: PWideChar;
   fCredentialUse: ULONG; pvLogonID, pAuthData, pGetKeyFn, pvGetKeyArgument: Pointer;
@@ -242,15 +323,20 @@ end;
 
 { TPipeSchannelStream }
 
-constructor TPipeSchannelStream.Create(AUnderlying: TStream;
-  const ATargetName: string; AVerifyPeer: Boolean);
+constructor TPipeSchannelStream.CreateDeferred(AUnderlying: TStream);
 begin
   inherited Create;
   FUnderlying := AUnderlying;
-  FTargetName := UnicodeString(ATargetName);
-  FVerifyPeer := AVerifyPeer;
   SetLength(FCipher, RAW_CHUNK);
   FCipherLen := 0;
+end;
+
+constructor TPipeSchannelStream.Create(AUnderlying: TStream;
+  const ATargetName: string; AVerifyPeer: Boolean);
+begin
+  CreateDeferred(AUnderlying);
+  FTargetName := UnicodeString(ATargetName);
+  FVerifyPeer := AVerifyPeer;
   // Se AcquireCred/DoHandshake levantarem, o Delphi chama o destrutor
   // automaticamente — que libera credencial/contexto (guardados por
   // FCredValid/FCtxtValid) e o stream de baixo. Nada de cleanup manual aqui
@@ -658,6 +744,210 @@ begin
     end;
     FreeContextBuffer(LOutBuf.pvBuffer);
   end;
+end;
+
+
+{ --- certificado do servidor ------------------------------------------------ }
+
+function PipeSchannelLoadPfx(const AFileName, APassword: string): Pointer;
+var
+  LStream: TFileStream;
+  LData: TBytes;
+  LBlob: TCryptDataBlob;
+  LStore: THandle;
+  LCert, LFound: Pointer;
+  LSize: DWORD;
+  LPwd: UnicodeString;
+begin
+  Result := nil;
+  if not FileExists(AFileName) then
+    raise EPipeTls.CreateFmt('certificado nao encontrado: %s', [AFileName]);
+  LStream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(LData, LStream.Size);
+    if Length(LData) = 0 then
+      raise EPipeTls.CreateFmt('certificado vazio: %s', [AFileName]);
+    LStream.ReadBuffer(LData[0], Length(LData));
+  finally
+    LStream.Free;
+  end;
+
+  LBlob.cbData := Length(LData);
+  LBlob.pbData := @LData[0];
+  LPwd := UnicodeString(APassword);
+  // CRYPT_EXPORTABLE: a chave privada precisa ficar utilizavel pelo SChannel.
+  LStore := PFXImportCertStore(@LBlob, PWideChar(LPwd), CRYPT_EXPORTABLE);
+  if LStore = 0 then
+    raise EPipeTls.CreateFmt(
+      'PFXImportCertStore falhou em %s (erro %d) — senha errada ou arquivo ' +
+      'corrompido', [AFileName, GetLastError]);
+  try
+    // Um PFX costuma trazer a cadeia inteira; o que serve ao servidor e' o
+    // unico com CHAVE PRIVADA. Pegar "o primeiro" pegaria a CA e o handshake
+    // falharia depois, longe daqui.
+    LFound := nil;
+    LCert := CertEnumCertificatesInStore(LStore, nil);
+    while LCert <> nil do
+    begin
+      LSize := 0;
+      if CertGetCertificateContextProperty(LCert, CERT_KEY_PROV_INFO_PROP_ID,
+           nil, LSize) then
+      begin
+        LFound := LCert;
+        Break;
+      end;
+      LCert := CertEnumCertificatesInStore(LStore, LCert);
+    end;
+    if LFound = nil then
+      raise EPipeTls.CreateFmt(
+        '%s nao contem certificado com chave privada', [AFileName]);
+    // Duplica: o contexto precisa sobreviver ao fechamento do store.
+    Result := CertDuplicateCertificateContext(LFound);
+  finally
+    CertCloseStore(LStore, 0);
+  end;
+end;
+
+procedure PipeSchannelFreeCert(ACertContext: Pointer);
+begin
+  if ACertContext <> nil then
+    CertFreeCertificateContext(ACertContext);
+end;
+
+{ TPipeSchannelServerStream }
+
+constructor TPipeSchannelServerStream.Create(AUnderlying: TStream;
+  ACertContext: Pointer);
+begin
+  CreateDeferred(AUnderlying);
+  if ACertContext = nil then
+    raise EPipeTls.Create('servidor TLS exige certificado');
+  FCertContext := ACertContext;
+  FVerifyPeer := False; // sem mTLS ainda: o cliente nao apresenta certificado
+end;
+
+procedure TPipeSchannelServerStream.Negotiate;
+begin
+  if FNegotiated then
+    Exit;
+  AcquireServerCred;
+  DoServerHandshake;
+  FNegotiated := True;
+end;
+
+procedure TPipeSchannelServerStream.AcquireServerCred;
+var
+  LCred: TSChannelCred;
+  LCertArray: array[0..0] of Pointer;
+  LStatus: SECURITY_STATUS;
+begin
+  FillChar(LCred, SizeOf(LCred), 0);
+  LCred.dwVersion := SCHANNEL_CRED_VERSION;
+  LCertArray[0] := FCertContext;
+  LCred.cCreds := 1;
+  LCred.paCred := @LCertArray[0];
+  // Sem validacao de cliente: mTLS e T4. Aqui o servidor so se apresenta.
+  LCred.dwFlags := SCH_CRED_NO_SYSTEM_MAPPER;
+  // grbitEnabledProtocols = 0: o SChannel escolhe (TLS 1.2/1.3).
+
+  LStatus := AcquireCredentialsHandleW(nil, UNISP_NAME, SECPKG_CRED_INBOUND,
+    nil, @LCred, nil, nil, @FCred, nil);
+  if StatusFailed(LStatus) then
+    raise EPipeTls.CreateFmt(
+      'AcquireCredentialsHandle(INBOUND) falhou (0x%.8x)', [Cardinal(LStatus)]);
+  FCredValid := True;
+  PipeSetTlsBackendDetail('SChannel (SSPI, nativo do Windows)');
+end;
+
+procedure TPipeSchannelServerStream.DoServerHandshake;
+var
+  LInBuf: array[0..1] of TSecBuffer;
+  LOutBuf: array[0..0] of TSecBuffer;
+  LInDesc, LOutDesc: TSecBufferDesc;
+  LAttr: ULONG;
+  LStatus: SECURITY_STATUS;
+  LCtxPtr: PCtxtHandle;
+  LReadMore: Boolean;
+  LExtra: Integer;
+begin
+  // Diferenca central em relacao ao cliente: o servidor NUNCA fala primeiro.
+  // Nao ha chamada inicial sem entrada — espera-se o ClientHello.
+  LReadMore := True;
+  while True do
+  begin
+    if LReadMore or (FCipherLen = 0) then
+      RecvRaw;
+
+    LInBuf[0].cbBuffer := FCipherLen;
+    LInBuf[0].BufferType := SECBUFFER_TOKEN;
+    LInBuf[0].pvBuffer := @FCipher[0];
+    LInBuf[1].cbBuffer := 0;
+    LInBuf[1].BufferType := SECBUFFER_EMPTY;
+    LInBuf[1].pvBuffer := nil;
+    LInDesc.ulVersion := SECBUFFER_VERSION;
+    LInDesc.cBuffers := 2;
+    LInDesc.pBuffers := @LInBuf[0];
+
+    LOutBuf[0].cbBuffer := 0;
+    LOutBuf[0].BufferType := SECBUFFER_TOKEN;
+    LOutBuf[0].pvBuffer := nil;
+    LOutDesc.ulVersion := SECBUFFER_VERSION;
+    LOutDesc.cBuffers := 1;
+    LOutDesc.pBuffers := @LOutBuf[0];
+
+    // Primeira chamada passa contexto nulo; as seguintes, o ja criado.
+    if FCtxtValid then
+      LCtxPtr := @FCtxt
+    else
+      LCtxPtr := nil;
+
+    LStatus := AcceptSecurityContext(@FCred, LCtxPtr, @LInDesc, ACCEPT_REQ,
+      SECURITY_NATIVE_DREP, @FCtxt, @LOutDesc, @LAttr, nil);
+
+    // Token de saida pendente (ate em SEC_E_OK pode haver): envia.
+    if (LOutBuf[0].cbBuffer > 0) and (LOutBuf[0].pvBuffer <> nil) then
+    begin
+      SendAll(LOutBuf[0].pvBuffer, LOutBuf[0].cbBuffer);
+      FreeContextBuffer(LOutBuf[0].pvBuffer);
+      LOutBuf[0].pvBuffer := nil;
+    end;
+
+    if StatusIs(LStatus, SEC_E_INCOMPLETE_MESSAGE) then
+    begin
+      LReadMore := True; // record incompleto: preserva FCipher e le mais
+      Continue;
+    end;
+
+    if StatusIs(LStatus, SEC_I_CONTINUE_NEEDED) or StatusIs(LStatus, SEC_E_OK) then
+    begin
+      FCtxtValid := True; // a partir daqui ha contexto a liberar no destructor
+      // Sobras (inicio do proximo record) vem em SECBUFFER_EXTRA, no FIM do
+      // buffer de entrada — mesma mecanica do lado cliente.
+      if LInBuf[1].BufferType = SECBUFFER_EXTRA then
+      begin
+        LExtra := LInBuf[1].cbBuffer;
+        if LExtra > 0 then
+          Move(FCipher[FCipherLen - LExtra], FCipher[0], LExtra);
+        FCipherLen := LExtra;
+      end
+      else
+        FCipherLen := 0;
+
+      if StatusIs(LStatus, SEC_E_OK) then
+        Break;
+      LReadMore := (FCipherLen = 0);
+      Continue;
+    end;
+
+    raise EPipeTls.CreateFmt('handshake TLS (servidor) falhou (0x%.8x)',
+      [Cardinal(LStatus)]);
+  end;
+
+  LStatus := QueryContextAttributesW(@FCtxt, SECPKG_ATTR_STREAM_SIZES,
+    @FStreamSizes);
+  if StatusFailed(LStatus) then
+    raise EPipeTls.CreateFmt(
+      'QueryContextAttributes(STREAM_SIZES) falhou (0x%.8x)', [Cardinal(LStatus)]);
 end;
 
 {$ENDIF PIPES_WINDOWS}

@@ -37,11 +37,16 @@ unit Pipes.Transport.Tls;
   - O contrato de Read difere do TStream: aqui Read NUNCA devolve 0 — fim de
     conexao e' EPipeClosed. A conversao e' feita neste adaptador.
 
-  Seguranca: o handshake do backend e' SINCRONO e acontece na construcao. Do
-  lado cliente isso e' inofensivo (quem chama e' quem espera). Do lado
-  SERVIDOR seria feito logo apos o accept, e um cliente que trave no meio do
-  handshake bloquearia a thread de accept inteira — por isso o servidor ptTls
-  ainda nao esta habilitado aqui (ver T1/T2 no README). }
+  Onde cada lado negocia:
+  - CLIENTE: no construtor, na thread de quem chamou Connect. Quem espera e'
+    quem pediu, entao bloquear ali nao afeta mais ninguem.
+  - SERVIDOR: NAO no accept. O listener devolve o endpoint ainda nao
+    negociado e quem chama Handshake e' a reader thread da conexao. Feito no
+    accept, um unico cliente travado no meio do handshake impediria o servidor
+    de aceitar todos os outros.
+
+  Estado: servidor implementado so no Windows (Schannel). No POSIX o lado
+  servidor do OpenSSL ainda falta, e TlsPipeCreateListener recusa. }
 
 interface
 
@@ -49,7 +54,10 @@ uses
   SysUtils,
   Classes,
   Pipes.Types,
-  Pipes.Transport;
+  Pipes.Transport
+  {$IFDEF PIPES_WINDOWS}
+  , Pipes.Transport.Schannel // TPipeSchannelServerStream e' campo da classe
+  {$ENDIF};
 
 type
   { Embrulha um TPipeEndpoint ja conectado numa sessao TLS. Assume a posse do
@@ -58,35 +66,59 @@ type
   private
     FInner: TPipeEndpoint;   // endpoint TCP; propriedade desta classe
     FTls: TStream;           // stream do backend; dono do TPipeEndpointStream
+    {$IFDEF PIPES_WINDOWS}
+    // <> nil enquanto ha negociacao de servidor pendente.
+    FServerTls: TPipeSchannelServerStream;
+    {$ENDIF}
   public
     /// ATargetName e' o nome usado para SNI e para validar o certificado
     /// (tipicamente o host de Address). AVerifyPeer=False desliga a validacao
     /// da cadeia — util so em laboratorio, nunca em producao.
     constructor Create(AInner: TPipeEndpoint; const ATargetName: string;
       AVerifyPeer: Boolean);
+    {$IFDEF PIPES_WINDOWS}
+    /// Lado SERVIDOR: embrulha o endpoint aceito sem negociar nada ainda. A
+    /// negociacao acontece em Handshake, chamado pela reader thread — no
+    /// accept, um cliente lento prenderia o servidor inteiro (ver T1).
+    constructor CreateServer(AInner: TPipeEndpoint; ACertContext: Pointer);
+    {$ENDIF}
     destructor Destroy; override;
+    procedure Handshake; override;
     function Read(var ABuffer; ACount: Integer): Integer; override;
     procedure WriteExactly(const ABuffer; ACount: Integer); override;
     procedure CloseAbort; override;
   end;
 
+{$IFDEF PIPES_WINDOWS}
+  { Listener que embrulha o listener TCP: cada conexao aceita volta como
+    TPipeTlsEndpoint AINDA NAO negociado. E' dono do certificado, que e'
+    compartilhado por todas as conexoes. }
+  TPipeTlsListener = class(TPipeListener)
+  private
+    FInner: TPipeListener;
+    FCertContext: Pointer;
+  public
+    constructor Create(AInner: TPipeListener; ACertContext: Pointer);
+    destructor Destroy; override;
+    function Accept: TPipeEndpoint; override;
+    procedure Close; override;
+  end;
+{$ENDIF}
+
 /// Conecta via TCP e faz o handshake TLS como CLIENTE.
 function TlsPipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
   AKeepAliveSeconds: Cardinal; AVerifyPeer: Boolean): TPipeEndpoint;
 
-/// Ainda nao implementado: exige handshake fora da thread de accept (T1) e o
-/// lado servidor dos backends (T2/T3), que nao existe no codigo herdado do
-/// pascal-amqp-faa — aquele projeto e' cliente e nunca aceita conexao.
+/// ACertFile e' um PFX com a chave privada do servidor. O handshake de cada
+/// conexao roda depois, na reader thread dela (ver TPipeEndpoint.Handshake).
 function TlsPipeCreateListener(const AAddress: string;
-  AKeepAliveSeconds: Cardinal): TPipeListener;
+  AKeepAliveSeconds: Cardinal;
+  const ACertFile, ACertPassword: string): TPipeListener;
 
 implementation
 
 uses
   Pipes.Transport.Tcp
-  {$IFDEF PIPES_WINDOWS}
-  , Pipes.Transport.Schannel
-  {$ENDIF}
   {$IFDEF PIPES_OPENSSL}
   , Pipes.Transport.OpenSSL
   {$ENDIF};
@@ -121,6 +153,30 @@ begin
     {$ELSE}
     raise EPipeTls.Create('build sem backend TLS: compile com PIPES_OPENSSL');
     {$ENDIF}
+  {$ENDIF}
+end;
+
+{$IFDEF PIPES_WINDOWS}
+constructor TPipeTlsEndpoint.CreateServer(AInner: TPipeEndpoint;
+  ACertContext: Pointer);
+var
+  LRaw: TPipeEndpointStream;
+begin
+  inherited Create;
+  FInner := AInner; // posse assumida ja (mesma regra do construtor cliente)
+  LRaw := TPipeEndpointStream.Create(AInner);
+  FServerTls := TPipeSchannelServerStream.Create(LRaw, ACertContext);
+  FTls := FServerTls;
+end;
+{$ENDIF}
+
+procedure TPipeTlsEndpoint.Handshake;
+begin
+  {$IFDEF PIPES_WINDOWS}
+  // So o lado servidor tem negociacao pendente; no cliente ela ja aconteceu
+  // no construtor, na thread de quem chamou Connect.
+  if Assigned(FServerTls) then
+    FServerTls.Negotiate;
   {$ENDIF}
 end;
 
@@ -174,12 +230,66 @@ begin
   Result := TPipeTlsEndpoint.Create(LTcp, LHost, AVerifyPeer);
 end;
 
-function TlsPipeCreateListener(const AAddress: string;
-  AKeepAliveSeconds: Cardinal): TPipeListener;
+{$IFDEF PIPES_WINDOWS}
+
+{ TPipeTlsListener }
+
+constructor TPipeTlsListener.Create(AInner: TPipeListener;
+  ACertContext: Pointer);
 begin
+  inherited Create;
+  FInner := AInner;
+  FCertContext := ACertContext;
+end;
+
+destructor TPipeTlsListener.Destroy;
+begin
+  FInner.Free;
+  PipeSchannelFreeCert(FCertContext);
+  inherited;
+end;
+
+function TPipeTlsListener.Accept: TPipeEndpoint;
+var
+  LTcp: TPipeEndpoint;
+begin
+  LTcp := FInner.Accept;
+  if LTcp = nil then
+    Exit(nil); // listener fechado
+  // Sem handshake aqui de proposito: esta chamada roda na thread de accept.
+  Result := TPipeTlsEndpoint.CreateServer(LTcp, FCertContext);
+end;
+
+procedure TPipeTlsListener.Close;
+begin
+  FInner.Close;
+end;
+
+{$ENDIF}
+
+function TlsPipeCreateListener(const AAddress: string;
+  AKeepAliveSeconds: Cardinal;
+  const ACertFile, ACertPassword: string): TPipeListener;
+{$IFDEF PIPES_WINDOWS}
+var
+  LTcp: TPipeListener;
+  LCert: Pointer;
+{$ENDIF}
+begin
+  {$IFDEF PIPES_WINDOWS}
+  LCert := PipeSchannelLoadPfx(ACertFile, ACertPassword);
+  try
+    LTcp := TcpPipeCreateListener(AAddress, AKeepAliveSeconds);
+  except
+    PipeSchannelFreeCert(LCert); // o listener nao chegou a assumir a posse
+    raise;
+  end;
+  Result := TPipeTlsListener.Create(LTcp, LCert);
+  {$ELSE}
   Result := nil;
-  raise EPipeTls.Create('servidor ptTls ainda nao implementado ' +
-    '(o lado cliente ja funciona)');
+  raise EPipeTls.Create('servidor ptTls no POSIX ainda nao implementado ' +
+    '(exige o lado servidor do OpenSSL)');
+  {$ENDIF}
 end;
 
 end.
