@@ -249,6 +249,10 @@ var
   // quem resolve simbolo em runtime, nao). A ASSINATURA e a semantica sao
   // identicas — os dois incrementam o refcount, entao o chamador sempre
   // X509_free. Resolvido por tentativa em SslLoad.
+  //
+  // O ramo antigo so' e' exercitado numa maquina onde a 3.x NAO exista (com as
+  // duas instaladas o loader escolhe a 3.x): a suite roda nele em
+  // debian:bullseye, que tem apenas libssl 1.1.1 — ver README, secao Testes.
   p_SSL_get_peer_certificate: function(ASsl: Pointer): Pointer; cdecl;
   // libcrypto
   p_BIO_new: function(AMethod: Pointer): Pointer; cdecl;

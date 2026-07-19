@@ -376,6 +376,13 @@ marcados `deprecated` só depois que samples e testes migrarem.
   (`-Fi` é necessário desde que os testes passaram a incluir `pipes.inc`, para enxergar
   quais backends o build tem.)
 
+- OpenSSL **1.1** (o outro ramo suportado): trocar a imagem por `debian:bullseye`, que traz
+  `libssl 1.1.1` e **não** tem a 3.x. Não é redundante com a anterior — é a única forma de
+  exercitar o fallback de símbolo do getter do certificado do par, que o 3.x renomeou
+  (`SSL_get_peer_certificate` → `SSL_get1_peer_certificate`). Com as duas versões instaladas
+  o loader escolheria a 3.x e o ramo antigo nunca rodaria; numa imagem onde só existe a 1.1,
+  ele é obrigatório.
+
 A suíte de integração inclui stress de encerramento (Stop sob flood < 2 s), detector de
 vazamento de handle/fd em quedas abruptas repetidas e correlação RPC sob concorrência.
 
