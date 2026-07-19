@@ -119,6 +119,12 @@ type
     FCertContext: Pointer; // PCCERT_CONTEXT; a POSSE fica com o chamador
     FCaStore: THandle;     // raiz das CAs de cliente (mTLS); 0 = sem mTLS
     FNegotiated: Boolean;
+    // Identidade do cliente, extraida do certificado JA VALIDADO. Preenchida
+    // uma unica vez em VerifyClientChain e imutavel depois — quem le e' outra
+    // thread (ver TPipeServer.TryClientIdentity), e imutabilidade e' o que
+    // dispensa lock aqui.
+    FPeerIdentity: TPipePeerIdentity;
+    FHasPeerIdentity: Boolean;
     procedure AcquireServerCred;
     procedure DoServerHandshake;
     /// mTLS: valida a cadeia do certificado que o cliente apresentou contra
@@ -135,6 +141,9 @@ type
       ACaStore: THandle);
     /// Idempotente. Levanta EPipeTls se a negociacao falhar.
     procedure Negotiate;
+    /// Identidade do cliente sob mTLS. False sem mTLS (nao ha certificado) ou
+    /// antes de Negotiate.
+    function TryPeerIdentity(out AIdentity: TPipePeerIdentity): Boolean;
   end;
 
 /// Carrega um certificado de servidor (com chave privada) de um arquivo PFX.
@@ -289,6 +298,10 @@ const
   CERT_CHAIN_POLICY_SSL    = 4; // passado como MAKEINTRESOURCE, nao como OID
   CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG = $00000010;
   AUTHTYPE_CLIENT          = 2;
+  // Extracao do nome do par (CertGetNameString).
+  CERT_NAME_ATTR_TYPE      = 3; // pvTypePara = OID do atributo (ex.: CN)
+  CERT_NAME_RDN_TYPE       = 2; // subject inteiro como DN legivel
+  szOID_COMMON_NAME        = '2.5.4.3';
   szOID_PKIX_KP_CLIENT_AUTH = '1.3.6.1.5.5.7.3.2';
 
 type
@@ -413,6 +426,12 @@ function CertFindCertificateInStore(hCertStore: THandle;
   dwCertEncodingType, dwFindFlags, dwFindType: DWORD; pvFindPara: Pointer;
   pPrevCertContext: Pointer): Pointer; stdcall;
   external 'crypt32.dll' name 'CertFindCertificateInStore';
+// Devolve o tamanho em CARACTERES (incluindo o #0), nunca 0 — um certificado
+// sem o atributo pedido devolve 1, a string vazia.
+function CertGetNameStringW(pCertContext: Pointer; dwType: DWORD;
+  dwFlags: DWORD; pvTypePara: Pointer; pszNameString: PWideChar;
+  cchNameString: DWORD): DWORD; stdcall;
+  external 'crypt32.dll' name 'CertGetNameStringW';
 
 function AcquireCredentialsHandleW(pszPrincipal, pszPackage: PWideChar;
   fCredentialUse: ULONG; pvLogonID, pAuthData, pGetKeyFn, pvGetKeyArgument: Pointer;
@@ -1032,6 +1051,25 @@ begin
     CertCloseStore(AStore, 0);
 end;
 
+// Le um nome do certificado. ATypePara nil = subject inteiro (RDN); ou o OID
+// de um atributo (CN). Devolve '' quando o atributo nao existe.
+function SchannelCertName(ACert: Pointer; AType: DWORD;
+  ATypePara: Pointer): string;
+var
+  LLen: DWORD;
+  LBuf: array of WideChar;
+begin
+  Result := '';
+  // A API sempre conta o terminador, entao 1 significa "vazio".
+  LLen := CertGetNameStringW(ACert, AType, 0, ATypePara, nil, 0);
+  if LLen <= 1 then
+    Exit;
+  SetLength(LBuf, LLen);
+  if CertGetNameStringW(ACert, AType, 0, ATypePara, @LBuf[0], LLen) <= 1 then
+    Exit;
+  Result := WideCharToString(PWideChar(@LBuf[0]));
+end;
+
 { TPipeSchannelServerStream }
 
 constructor TPipeSchannelServerStream.Create(AUnderlying: TStream;
@@ -1059,11 +1097,25 @@ begin
   FNegotiated := True;
 end;
 
+function TPipeSchannelServerStream.TryPeerIdentity(
+  out AIdentity: TPipePeerIdentity): Boolean;
+begin
+  Result := FHasPeerIdentity;
+  if Result then
+    AIdentity := FPeerIdentity
+  else
+  begin
+    Finalize(AIdentity);
+    FillChar(AIdentity, SizeOf(AIdentity), 0);
+  end;
+end;
+
 procedure TPipeSchannelServerStream.VerifyClientChain;
 var
   LRemote: Pointer;
   LStatus: SECURITY_STATUS;
   LOid: AnsiString;
+  LOidCn: AnsiString;
   LUsage: array[0..0] of PAnsiChar;
   LPara: TCertChainPara;
   LChain: Pointer;
@@ -1092,6 +1144,7 @@ begin
     // 1. Construir a cadeia. FCaStore entra como store ADICIONAL: fornece o
     // emissor, mas nao o torna confiavel — isso e' o passo 3.
     LOid := szOID_PKIX_KP_CLIENT_AUTH;
+    LOidCn := szOID_COMMON_NAME;
     LUsage[0] := PAnsiChar(LOid);
     FillChar(LPara, SizeOf(LPara), 0);
     LPara.cbSize := SizeOf(LPara);
@@ -1165,6 +1218,15 @@ begin
         raise EPipeTls.CreateFmt(
           'mTLS: certificado de cliente recusado pela politica SSL (0x%.8x)',
           [LPolicyStatus.dwError]);
+
+      // Aqui, e SO aqui, a identidade passa a ser confiavel: a cadeia fechou
+      // na CA configurada e a politica aprovou. Extrair antes de qualquer um
+      // dos raises acima faria um CommonName forjado existir em memoria com
+      // aparencia de validado.
+      FPeerIdentity.CommonName := SchannelCertName(LRemote, CERT_NAME_ATTR_TYPE,
+        PAnsiChar(LOidCn));
+      FPeerIdentity.Subject := SchannelCertName(LRemote, CERT_NAME_RDN_TYPE, nil);
+      FHasPeerIdentity := True;
     finally
       CertFreeCertificateChain(LChain);
     end;

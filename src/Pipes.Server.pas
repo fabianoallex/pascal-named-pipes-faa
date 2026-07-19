@@ -61,6 +61,15 @@ type
     FReader: TThread;
     FWriteLock: TCriticalSection;
     FRefs: Integer;
+    // Conexao ESTABELECIDA: handshake concluido, prestes a disparar
+    // OnClientConnected. Antes disso ela existe (ocupa vaga de MaxClients) mas
+    // nao aparece em ClientIds/ClientCount — sob mTLS, uma conexao ainda
+    // negociando pode nunca se autenticar, e contar como "cliente" um par que
+    // sera' recusado e' o que fazia o painel piscar clientes fantasmas.
+    // Escrito sob FConnLock pela reader thread; lido sob FConnLock.
+    FEstablished: Boolean;
+    FIdentity: TPipePeerIdentity;
+    FHasIdentity: Boolean;
     procedure AddRef;
     procedure Release; // libera o objeto quando zera
     procedure StartReader;
@@ -87,6 +96,10 @@ type
     FOnRequest: TPipeRequestEvent;
     // Chamados pelas threads/works internos (mesma unit):
     procedure HandleAccepted(AEndpoint: TPipeEndpoint);
+    /// Marca a conexao como estabelecida e captura a identidade do par, se
+    /// houver. Chamada pela reader thread apos o Handshake, ANTES de
+    /// OnClientConnected.
+    procedure PublishEstablished(AConn: TPipeServerConnection);
     procedure AcceptorFinished(const AError: string);
     procedure ReaderFinished(AConn: TPipeServerConnection; const AError: string);
     procedure HandleFrame(AConn: TPipeServerConnection; const AFrame: TPipeFrame);
@@ -117,8 +130,27 @@ type
     procedure BroadcastText(const AText: string);
     /// Assincrono e idempotente: aborta a conexao; a limpeza roda no pool.
     procedure DisconnectClient(AConnId: TPipeConnectionId);
+    /// Quantos clientes ESTABELECIDOS — aqueles para os quais
+    /// OnClientConnected ja disparou e OnClientDisconnected ainda nao. Conexoes
+    /// aceitas mas ainda negociando TLS nao entram: sob mTLS elas podem nunca
+    /// se autenticar.
+    ///
+    /// Difere de MaxClients de proposito: aquele e' um limite de RECURSO e
+    /// conta tambem as conexoes em negociacao, senao um par que nunca conclui
+    /// o handshake nao ocuparia vaga nenhuma.
     function ClientCount: Integer;
+    /// Ids dos clientes estabelecidos (mesmo criterio de ClientCount).
     function ClientIds: TArray<TPipeConnectionId>;
+    /// Quem e' o cliente, segundo o certificado validado no handshake mTLS.
+    /// False quando a conexao nao existe (ou ja caiu) ou quando nao ha
+    /// identidade verificada — sem TLS, ou com TLS sem mTLS. False NUNCA
+    /// significa "ainda nao chegou": nao ha o que esperar.
+    ///
+    /// E' Try* e nao levanta como SendBytes porque o uso tipico e' varrer
+    /// ClientIds e consultar cada um; entre as duas chamadas uma conexao pode
+    /// cair, e uma excecao ali obrigaria try/except dentro do laco.
+    function TryClientIdentity(AConnId: TPipeConnectionId;
+      out AIdentity: TPipePeerIdentity): Boolean;
     property MaxClients: Integer read FMaxClients write FMaxClients; // 0 = sem teto
     property OnClientConnected: TPipeConnectionEvent
       read FOnClientConnected write FOnClientConnected;
@@ -227,6 +259,11 @@ begin
     // So depois de negociar o cliente conta como conectado — com mTLS e' o
     // ponto em que ele esta autenticado. Handshake que falha nunca dispara
     // OnClientConnected: cai direto no except como qualquer outra queda.
+    //
+    // A ordem aqui e' contratual: publicar ANTES do evento, para que um
+    // handler de OnClientConnected que consulte ClientIds/TryClientIdentity ja
+    // enxergue a propria conexao que acabou de ser anunciada.
+    FConn.FServer.PublishEstablished(FConn);
     FConn.FServer.DispatchConnEvent(FConn.FServer.FOnClientConnected, FConn.Id);
     while True do
     begin
@@ -573,7 +610,11 @@ var
 begin
   FConnLock.Enter;
   try
-    if FConnections.TryGetValue(AConnId, LConn) then
+    // FEstablished na condicao: um id so' vira publico em OnClientConnected,
+    // que roda depois do handshake, entao na pratica ninguem tem como pedir
+    // envio para uma conexao em negociacao. A checagem fecha o caso de um id
+    // adivinhado ou guardado — e mantem a mesma regra de Broadcast.
+    if FConnections.TryGetValue(AConnId, LConn) and LConn.FEstablished then
       LConn.AddRef // segura o objeto durante a escrita (fora do lock)
     else
       LConn := nil;
@@ -603,11 +644,22 @@ var
 begin
   // Snapshot com AddRef sob o lock; envio fora dele (cliente lento nao trava
   // a lista) sob o write lock individual de cada conexao.
+  //
+  // So conexoes ESTABELECIDAS entram. Nao e' cosmetico: sob mTLS uma conexao
+  // ainda em handshake e' um par que NAO se autenticou, e mandar payload de
+  // aplicacao para ele seria vazar dado para quem talvez seja recusado a
+  // seguir. (Mesmo sem mTLS o envio estaria errado: a sessao TLS ainda nao
+  // existe, entao nao ha por onde cifrar.)
+  SetLength(LConns, 0);
   FConnLock.Enter;
   try
-    LConns := FConnections.Values.ToArray;
-    for LConn in LConns do
-      LConn.AddRef;
+    for LConn in FConnections.Values do
+      if LConn.FEstablished then
+      begin
+        LConn.AddRef;
+        SetLength(LConns, Length(LConns) + 1);
+        LConns[High(LConns)] := LConn;
+      end;
   finally
     FConnLock.Leave;
   end;
@@ -647,21 +699,82 @@ begin
   QueueCleanup(LConn);
 end;
 
-function TPipeServer.ClientCount: Integer;
+procedure TPipeServer.PublishEstablished(AConn: TPipeServerConnection);
+var
+  LIdentity: TPipePeerIdentity;
+  LHas: Boolean;
 begin
+  // A consulta ao endpoint fica FORA do FConnLock: ela nao faz IO (a
+  // identidade ja foi extraida durante o handshake e so' esta guardada), mas
+  // segurar o lock das conexoes enquanto se chama codigo do transporte
+  // inverteria a ordem "lista de conexoes -> transporte" que o resto da unit
+  // respeita.
+  LHas := AConn.FEndpoint.TryPeerIdentity(LIdentity);
   FConnLock.Enter;
   try
-    Result := FConnections.Count;
+    if LHas then
+    begin
+      AConn.FIdentity := LIdentity;
+      AConn.FHasIdentity := True;
+    end;
+    AConn.FEstablished := True;
+  finally
+    FConnLock.Leave;
+  end;
+end;
+
+function TPipeServer.ClientCount: Integer;
+var
+  LConn: TPipeServerConnection;
+begin
+  Result := 0;
+  FConnLock.Enter;
+  try
+    for LConn in FConnections.Values do
+      if LConn.FEstablished then
+        Inc(Result);
+  finally
+    FConnLock.Leave;
+  end;
+end;
+
+function TPipeServer.TryClientIdentity(AConnId: TPipeConnectionId;
+  out AIdentity: TPipePeerIdentity): Boolean;
+var
+  LConn: TPipeServerConnection;
+begin
+  Result := False;
+  Finalize(AIdentity);
+  FillChar(AIdentity, SizeOf(AIdentity), 0);
+  FConnLock.Enter;
+  try
+    if FConnections.TryGetValue(AConnId, LConn) and LConn.FEstablished
+       and LConn.FHasIdentity then
+    begin
+      AIdentity := LConn.FIdentity;
+      Result := True;
+    end;
   finally
     FConnLock.Leave;
   end;
 end;
 
 function TPipeServer.ClientIds: TArray<TPipeConnectionId>;
+var
+  LConn: TPipeServerConnection;
+  LCount: Integer;
 begin
   FConnLock.Enter;
   try
-    Result := FConnections.Keys.ToArray;
+    SetLength(Result, FConnections.Count); // teto; encolhe no fim
+    LCount := 0;
+    for LConn in FConnections.Values do
+      if LConn.FEstablished then
+      begin
+        Result[LCount] := LConn.Id;
+        Inc(LCount);
+      end;
+    SetLength(Result, LCount);
   finally
     FConnLock.Leave;
   end;

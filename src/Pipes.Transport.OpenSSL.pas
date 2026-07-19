@@ -113,7 +113,13 @@ type
   private
     FOptions: TPipeTlsOptions;
     FNegotiated: Boolean;
+    // Identidade do cliente sob mTLS. Preenchida uma unica vez, ao fim de
+    // Negotiate, e imutavel depois — e' o que dispensa lock na leitura por
+    // outra thread (ver TPipeServer.TryClientIdentity).
+    FPeerIdentity: TPipePeerIdentity;
+    FHasPeerIdentity: Boolean;
     procedure SetupServerSsl;
+    procedure CapturePeerIdentity;
   public
     /// Le CertFile/KeyFile (PEM) como identidade do servidor. Se CaFile estiver
     /// preenchido, exige e valida certificado de CLIENTE contra essa CA (mTLS).
@@ -121,6 +127,9 @@ type
       const AOptions: TPipeTlsOptions);
     /// Idempotente. Levanta EPipeTls se a negociacao falhar.
     procedure Negotiate;
+    /// Identidade do cliente sob mTLS. False sem mTLS (nao ha certificado) ou
+    /// antes de Negotiate.
+    function TryPeerIdentity(out AIdentity: TPipePeerIdentity): Boolean;
   end;
 
 {$ENDIF PIPES_OPENSSL}
@@ -198,6 +207,7 @@ const
   SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 2;
 
   X509_V_OK = 0;
+  NID_commonName = 13; // OID 2.5.4.3, estavel desde sempre no OpenSSL
 
   RAW_CHUNK = 16384; // leitura de socket por rodada (record TLS máx ~16KB)
 
@@ -233,6 +243,13 @@ var
   p_SSL_get_error: function(ASsl: Pointer; ARet: Integer): Integer; cdecl;
   p_SSL_shutdown: function(ASsl: Pointer): Integer; cdecl;
   p_SSL_get_verify_result: function(ASsl: Pointer): TSslLong; cdecl;
+  // Certificado do par. EXCECAO a regra "mesmo nome nos dois ramos" declarada
+  // no cabecalho desta unit: o 1.1 chama SSL_get_peer_certificate e o 3.x
+  // renomeou para SSL_get1_peer_certificate (no C um macro esconde isso; para
+  // quem resolve simbolo em runtime, nao). A ASSINATURA e a semantica sao
+  // identicas — os dois incrementam o refcount, entao o chamador sempre
+  // X509_free. Resolvido por tentativa em SslLoad.
+  p_SSL_get_peer_certificate: function(ASsl: Pointer): Pointer; cdecl;
   // libcrypto
   p_BIO_new: function(AMethod: Pointer): Pointer; cdecl;
   p_BIO_s_mem: function: Pointer; cdecl;
@@ -244,6 +261,13 @@ var
   p_ERR_error_string_n: procedure(AErr: TSslULong; ABuf: PAnsiChar;
     ALen: NativeUInt); cdecl;
   p_ERR_clear_error: procedure; cdecl;
+  // Extracao da identidade do par (nomes iguais em 1.1 e 3.x).
+  p_X509_free: procedure(ACert: Pointer); cdecl;
+  p_X509_get_subject_name: function(ACert: Pointer): Pointer; cdecl;
+  p_X509_NAME_get_text_by_NID: function(AName: Pointer; ANid: Integer;
+    ABuf: PAnsiChar; ALen: Integer): Integer; cdecl;
+  p_X509_NAME_oneline: function(AName: Pointer; ABuf: PAnsiChar;
+    ALen: Integer): PAnsiChar; cdecl;
   // Opcional (só para diagnóstico via PipeTlsBackendInfo); OpenSSL_version(0)
   // = OPENSSL_VERSION, a string completa 'OpenSSL x.y.z data'.
   p_OpenSSL_version: function(AType: Integer): PAnsiChar; cdecl;
@@ -381,6 +405,20 @@ begin
       p_ERR_get_error := SslMustGet(LCrypto, 'ERR_get_error', LCryptoName);
       p_ERR_error_string_n := SslMustGet(LCrypto, 'ERR_error_string_n', LCryptoName);
       p_ERR_clear_error := SslMustGet(LCrypto, 'ERR_clear_error', LCryptoName);
+      p_X509_free := SslMustGet(LCrypto, 'X509_free', LCryptoName);
+      p_X509_get_subject_name :=
+        SslMustGet(LCrypto, 'X509_get_subject_name', LCryptoName);
+      p_X509_NAME_get_text_by_NID :=
+        SslMustGet(LCrypto, 'X509_NAME_get_text_by_NID', LCryptoName);
+      p_X509_NAME_oneline :=
+        SslMustGet(LCrypto, 'X509_NAME_oneline', LCryptoName);
+      // O 3.x renomeou este; o 1.1 so tem o nome antigo. Tentar os dois e
+      // exigir que UM exista — se nenhum existir, a identidade do par ficaria
+      // silenciosamente vazia sob mTLS, que e' pior do que falhar ao carregar.
+      p_SSL_get_peer_certificate := SslGetProc(LSsl, 'SSL_get1_peer_certificate');
+      if not Assigned(p_SSL_get_peer_certificate) then
+        p_SSL_get_peer_certificate :=
+          SslMustGet(LSsl, 'SSL_get_peer_certificate', LSslName);
       // Opcional: falta do símbolo não é erro (fica só o nome do backend).
       p_OpenSSL_version := SslGetProc(LCrypto, 'OpenSSL_version');
     except
@@ -853,7 +891,60 @@ begin
   EnsureOpenSsl;
   SetupServerSsl;
   DoHandshake; // SSL_do_handshake serve aos dois lados
+  // Depois do handshake: com SSL_VERIFY_PEER + FAIL_IF_NO_PEER_CERT, chegar
+  // aqui ja significa que o certificado do cliente foi validado contra CaFile.
+  CapturePeerIdentity;
   FNegotiated := True;
+end;
+
+// Le um campo de texto do subject. Devolve '' se o atributo nao existir.
+function SslNameText(AName: Pointer; ANid: Integer): string;
+var
+  LBuf: array[0..255] of AnsiChar;
+  LLen: Integer;
+begin
+  Result := '';
+  LLen := p_X509_NAME_get_text_by_NID(AName, ANid, @LBuf[0], SizeOf(LBuf));
+  if LLen > 0 then
+    Result := string(AnsiString(PAnsiChar(@LBuf[0])));
+end;
+
+procedure TPipeOpenSslServerStream.CapturePeerIdentity;
+var
+  LCert: Pointer;
+  LName: Pointer;
+  LBuf: array[0..511] of AnsiChar;
+begin
+  // Sem mTLS o cliente nao apresenta nada e isto devolve nil — nao e' erro,
+  // e' a ausencia de identidade.
+  LCert := p_SSL_get_peer_certificate(FSsl);
+  if LCert = nil then
+    Exit;
+  try
+    LName := p_X509_get_subject_name(LCert);
+    if LName = nil then
+      Exit;
+    FPeerIdentity.CommonName := SslNameText(LName, NID_commonName);
+    if p_X509_NAME_oneline(LName, @LBuf[0], SizeOf(LBuf)) <> nil then
+      FPeerIdentity.Subject := string(AnsiString(PAnsiChar(@LBuf[0])));
+    FHasPeerIdentity := True;
+  finally
+    // Os dois nomes do getter incrementam o refcount: liberar sempre.
+    p_X509_free(LCert);
+  end;
+end;
+
+function TPipeOpenSslServerStream.TryPeerIdentity(
+  out AIdentity: TPipePeerIdentity): Boolean;
+begin
+  Result := FHasPeerIdentity;
+  if Result then
+    AIdentity := FPeerIdentity
+  else
+  begin
+    Finalize(AIdentity);
+    FillChar(AIdentity, SizeOf(AIdentity), 0);
+  end;
 end;
 
 procedure TPipeOpenSslServerStream.SetupServerSsl;

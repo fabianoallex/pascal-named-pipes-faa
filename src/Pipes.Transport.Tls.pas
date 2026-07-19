@@ -101,6 +101,8 @@ type
       ACaStore: THandle; const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     procedure Handshake; override;
+    function TryPeerIdentity(
+      out AIdentity: TPipePeerIdentity): Boolean; override;
     function Read(var ABuffer; ACount: Integer): Integer; override;
     procedure WriteExactly(const ABuffer; ACount: Integer); override;
     procedure CloseAbort; override;
@@ -263,6 +265,24 @@ begin
     // faria uma leitura ociosa normal estourar depois.
     FInner.SetIoDeadline(0);
   end;
+end;
+
+function TPipeTlsEndpoint.TryPeerIdentity(
+  out AIdentity: TPipePeerIdentity): Boolean;
+begin
+  // So o lado SERVIDOR expoe identidade do par: e' ele que exige e valida o
+  // certificado do cliente sob mTLS. No cliente, "quem e' o servidor" ja foi
+  // decidido na validacao da cadeia + hostname durante o handshake — devolver
+  // um nome ali convidaria a decidir confianca DEPOIS, que e' tarde.
+  {$IFDEF PIPES_OPENSSL}
+  if Assigned(FServerSsl) then
+    Exit(FServerSsl.TryPeerIdentity(AIdentity));
+  {$ENDIF}
+  {$IFDEF PIPES_SCHANNEL}
+  if Assigned(FServerTls) then
+    Exit(FServerTls.TryPeerIdentity(AIdentity));
+  {$ENDIF}
+  Result := inherited TryPeerIdentity(AIdentity);
 end;
 
 destructor TPipeTlsEndpoint.Destroy;

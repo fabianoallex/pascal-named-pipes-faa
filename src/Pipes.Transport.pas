@@ -63,6 +63,13 @@ type
     /// envolve — um backend novo sob TLS precisa implementar isto tambem, ou o
     /// prazo some em silencio.
     procedure SetIoDeadline(ATimeoutMs: Cardinal); virtual;
+    /// Quem e' o par, segundo o certificado que ele apresentou e que ja foi
+    /// validado. False quando nao ha identidade verificada — o caso de todos
+    /// os transportes sem TLS e do ptTls sem mTLS.
+    ///
+    /// So faz sentido chamar DEPOIS de Handshake: antes dele o par ainda nao
+    /// apresentou nada.
+    function TryPeerIdentity(out AIdentity: TPipePeerIdentity): Boolean; virtual;
   end;
 
   { Ponto de escuta do servidor. }
@@ -156,6 +163,17 @@ end;
 procedure TPipeEndpoint.SetIoDeadline(ATimeoutMs: Cardinal);
 begin
   // Sem prazo por padrao (ver o comentario da declaracao).
+end;
+
+function TPipeEndpoint.TryPeerIdentity(
+  out AIdentity: TPipePeerIdentity): Boolean;
+begin
+  // Transporte sem TLS nao tem certificado do par. Identidade por credencial
+  // do SO (SO_PEERCRED, GetNamedPipeClientProcessId) e' outra coisa — uid/pid,
+  // nao um nome — e ficaria errada atras desta mesma API.
+  Finalize(AIdentity);
+  FillChar(AIdentity, SizeOf(AIdentity), 0);
+  Result := False;
 end;
 
 { TPipeEndpointStream }

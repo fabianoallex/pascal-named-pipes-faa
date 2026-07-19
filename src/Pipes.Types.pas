@@ -84,6 +84,26 @@ type
     HandshakeTimeoutMs: Cardinal;
   end;
 
+  { Quem e' o par do outro lado, segundo o certificado que ele apresentou e que
+    JA FOI VALIDADO contra a CA configurada.
+
+    So existe sob mTLS (CaFile preenchido no servidor). Sem mTLS o cliente nao
+    apresenta certificado nenhum e nao ha identidade — nem uma vazia "provisoria":
+    TPipeServer.TryClientIdentity devolve False, e isso significa "esta conexao
+    nao tem identidade verificada", nunca "espere mais um pouco".
+
+    E' confiavel porque a cadeia foi conferida ANTES: um certificado com
+    CommonName forjado nao chega aqui, e' recusado no handshake. Por isso e'
+    seguro usar CommonName para identificar (mostrar, logar, rotear) — o que
+    NAO se deve fazer e' o contrario: derivar autorizacao de um nome quando a
+    cadeia nao foi validada. }
+  TPipePeerIdentity = record
+    /// CN do subject — 'pdv-loja-001'. E' o que se mostra na tela.
+    CommonName: string;
+    /// Subject completo (DN), para log e auditoria.
+    Subject: string;
+  end;
+
   TPipeMessageEvent = procedure(Sender: TObject; AConnId: TPipeConnectionId;
     const AData: TBytes) of object;
   /// Request-reply no servidor: o retorno em AReply vira o frame de resposta

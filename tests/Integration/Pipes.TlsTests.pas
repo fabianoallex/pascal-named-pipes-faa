@@ -39,6 +39,10 @@ type
     FClient: TPipeClient;
     FEcho: TEvent;
     FConnected: TEvent;
+    FLastConnId: TPipeConnectionId;
+    // Preenchidos DE DENTRO de OnClientConnected (ver o handler).
+    FIdentityFromHandler: TPipePeerIdentity;
+    FIdentityNoHandler: Boolean;
     FErroEvt: TEvent;   // sinalizado quando o servidor reporta um erro de conexao
     FRecebido: string;
     FErroServidor: string;
@@ -61,6 +65,9 @@ type
     destructor Destroy; override;
     property Server: TPipeServer read FServer;
     property Client: TPipeClient read FClient;
+    property LastConnId: TPipeConnectionId read FLastConnId;
+    property IdentityFromHandler: TPipePeerIdentity read FIdentityFromHandler;
+    property IdentityNoHandler: Boolean read FIdentityNoHandler;
     /// Sobe o servidor. ACaFile <> '' liga mTLS.
     procedure Listen(const ACaFile: string);
     /// Conecta o cliente; ACliCert <> '' apresenta certificado (mTLS).
@@ -111,6 +118,10 @@ type
     [Test] procedure Mtls_ClienteAutoAssinado_Recusado;
     [Test] procedure Mtls_ClienteDeCaGemea_Recusado;
     [Test] procedure Handshake_ClienteMudo_EstouraNoPrazo;
+    // --- identidade do par autenticado ---
+    [Test] procedure Mtls_IdentidadeDoCliente_TrazCnDoCertificado;
+    [Test] procedure Tls_SemMtls_NaoTemIdentidade;
+    [Test] procedure ClientIds_NaoListaConexaoEmHandshake;
     // --- configuracao ---
     [Test] procedure Tls_ListenSemCredenciais_Falha;
     [Test] procedure Tls_TrocaCertComServidorAtivo_Levanta;
@@ -139,6 +150,16 @@ end;
 procedure AssertFalse(const AMsg: string; ACond: Boolean);
 begin
   Assert.IsFalse(ACond, AMsg);
+end;
+
+procedure AssertEquals(const AMsg, AExpected, AActual: string); overload;
+begin
+  Assert.AreEqual(AExpected, AActual, AMsg);
+end;
+
+procedure AssertEquals(const AMsg: string; AExpected, AActual: Integer); overload;
+begin
+  Assert.AreEqual(AExpected, AActual, AMsg);
 end;
 
 var
@@ -239,6 +260,12 @@ end;
 procedure TTlsHarness.OnClientConnected(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
+  FLastConnId := AConnId;
+  // Consulta AQUI de proposito, de dentro do handler: o contrato e' que a
+  // conexao ja esteja publicada quando o evento dispara, entao um handler que
+  // pergunte "quem chegou?" tem de conseguir a resposta na hora.
+  FIdentityNoHandler :=
+    FServer.TryClientIdentity(AConnId, FIdentityFromHandler);
   FConnected.SetEvent;
 end;
 
@@ -596,6 +623,78 @@ begin
     LSrv.Listen; // sem CertFile: nao ha servidor TLS possivel
   finally
     LSrv.Free;
+  end;
+end;
+
+procedure TPipeTlsTests.Mtls_IdentidadeDoCliente_TrazCnDoCertificado;
+var
+  LErro: string;
+  LId: TPipePeerIdentity;
+begin
+  FHarness.Listen(Pki('ca_cert.pem'));
+  AssertTrue('cliente legitimo foi recusado: ' + LErro,
+    FHarness.TryConnect('cli', LErro));
+  AssertTrue('servidor nao autenticou o cliente',
+    FHarness.ClienteAutenticado(5000));
+
+  AssertTrue('servidor nao expos identidade do cliente autenticado',
+    FHarness.Server.TryClientIdentity(FHarness.LastConnId, LId));
+  // 'pdv-loja-001' e' o CN de cli_cert.pem. E' confiavel porque a cadeia foi
+  // validada ANTES: o certificado 'rogue' carrega este mesmo CN de proposito e
+  // nao chega ate aqui — e' recusado no handshake.
+  AssertEquals('CN do cliente', 'pdv-loja-001', LId.CommonName);
+  AssertTrue('Subject deveria conter o CN',
+    Pos('pdv-loja-001', LId.Subject) > 0);
+
+  // O contrato de publicacao: quem perguntar de dentro do proprio
+  // OnClientConnected ja tem de enxergar a conexao anunciada.
+  AssertTrue('identidade nao estava disponivel dentro de OnClientConnected',
+    FHarness.IdentityNoHandler);
+  AssertEquals('CN visto pelo handler', 'pdv-loja-001',
+    FHarness.IdentityFromHandler.CommonName);
+end;
+
+procedure TPipeTlsTests.Tls_SemMtls_NaoTemIdentidade;
+var
+  LErro: string;
+  LId: TPipePeerIdentity;
+begin
+  // TLS sem CaFile: o cliente nao apresenta certificado, entao nao ha
+  // identidade — e False aqui significa "nao ha", nunca "ainda nao chegou".
+  FHarness.Listen('');
+  AssertTrue('cliente deveria conectar: ' + LErro,
+    FHarness.TryConnect('', LErro));
+  AssertTrue('servidor nao registrou o cliente',
+    FHarness.ClienteAutenticado(5000));
+  AssertFalse('sem mTLS nao deveria haver identidade',
+    FHarness.Server.TryClientIdentity(FHarness.LastConnId, LId));
+  AssertEquals('CN deveria vir vazio', '', LId.CommonName);
+end;
+
+procedure TPipeTlsTests.ClientIds_NaoListaConexaoEmHandshake;
+var
+  LMudo: TPipeClient;
+begin
+  // Cliente ptTcp contra servidor ptTls: o socket conecta e o TLS nunca
+  // comeca. A conexao existe no servidor, mas nao esta estabelecida — e um
+  // par que ainda nao se autenticou nao pode contar como cliente, senao um
+  // painel mostraria clientes fantasmas e o Broadcast tentaria falar com quem
+  // talvez seja recusado a seguir.
+  //
+  // Prazo alto de proposito: o teste precisa observar a conexao AINDA em
+  // negociacao, nao depois de o servidor desistir dela.
+  FHarness.Server.TlsOptions.HandshakeTimeoutMs := 30000;
+  FHarness.Listen(Pki('ca_cert.pem'));
+  LMudo := TPipeClient.Create(FAddr, ptTcp);
+  try
+    LMudo.Connect(5000);
+    Sleep(700); // deixa o accept registrar a conexao
+    AssertEquals('conexao em handshake nao deveria contar como cliente',
+      0, FHarness.Server.ClientCount);
+    AssertEquals('ClientIds nao deveria listar conexao em handshake',
+      0, Length(FHarness.Server.ClientIds));
+  finally
+    LMudo.Free;
   end;
 end;
 

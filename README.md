@@ -127,6 +127,39 @@ A última linha é a pegadinha: uma PKI privada cujo certificado não esteja no 
 do Windows faz o *cliente* Schannel rejeitar o servidor mesmo com `CaFile` preenchido. Ou
 se instala a CA na máquina, ou se usa o backend OpenSSL.
 
+#### Quem está do outro lado
+
+Sob mTLS o servidor não só valida o certificado do cliente — ele guarda quem é:
+
+```pascal
+procedure TForm1.ClienteConectou(Sender: TObject; AConnId: TPipeConnectionId);
+var
+  LQuem: TPipePeerIdentity;
+begin
+  if Servidor.TryClientIdentity(AConnId, LQuem) then
+    Memo.Lines.Add('conectou: ' + LQuem.CommonName);  // 'pdv-loja-001'
+end;
+```
+
+O `CommonName` é confiável **porque a cadeia foi validada antes**: um certificado com
+`CN` forjado não chega a disparar `OnClientConnected`, é recusado no handshake. Então dá
+para usar esse nome para identificar — mostrar, logar, rotear. O que não se deve fazer é o
+inverso: derivar autorização de um nome sem que a cadeia tenha sido verificada.
+
+`TryClientIdentity` devolve `False` quando não há identidade *verificada* — sem TLS, ou com
+TLS sem mTLS. `False` nunca significa "ainda não chegou": não há o que esperar.
+
+> **Mudança de comportamento:** `ClientCount` e `ClientIds` passaram a contar apenas
+> conexões **estabelecidas** — aquelas para as quais `OnClientConnected` já disparou. Antes,
+> uma conexão aceita mas ainda negociando TLS já aparecia ali, o que sob mTLS significava
+> exibir como "cliente" um par que talvez fosse recusado em seguida. `Broadcast` segue a
+> mesma regra, e por um motivo mais forte que contagem: mandar payload para quem ainda não
+> se autenticou seria vazar dado. Para `ptLocal` e `ptTcp` nada muda na prática — sem
+> handshake, a conexão nasce estabelecida.
+>
+> `MaxClients` é deliberadamente diferente: como é limite de **recurso**, conta também as
+> conexões em negociação — senão um par que nunca conclui o handshake não ocuparia vaga.
+
 #### Prazo do handshake
 
 O handshake tem prazo próprio, `PIPE_TLS_HANDSHAKE_TIMEOUT_DEFAULT` (15 s), ajustável por
@@ -254,7 +287,9 @@ TPipeServer
   SendBytes/SendText(ConnId, ...)        // EPipeError se ConnId não existe
   Broadcast/BroadcastText(...)           // snapshot; falha por conexão é engolida
   DisconnectClient(ConnId)               // assíncrono e idempotente
-  ClientCount; ClientIds; MaxClients
+  ClientCount; ClientIds                 // só conexões ESTABELECIDAS
+  TryClientIdentity(ConnId, out Ident)   // quem é, pelo certificado mTLS validado
+  MaxClients                             // limite de recurso: conta as em handshake
   OnClientConnected/OnClientDisconnected: TPipeConnectionEvent
   OnRequest: TPipeRequestEvent           // (const ARequest: TBytes; out AReply: TBytes)
 
