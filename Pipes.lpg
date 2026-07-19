@@ -22,6 +22,16 @@
           <Mode Name="Default"/>
         </BuildModes>
       </Target>
+      <Target FileName="samples\EchoSeguro\EchoSeguroServer.lpi">
+        <BuildModes>
+          <Mode Name="Default"/>
+        </BuildModes>
+      </Target>
+      <Target FileName="samples\EchoSeguro\EchoSeguroClient.lpi">
+        <BuildModes>
+          <Mode Name="Default"/>
+        </BuildModes>
+      </Target>
       <Target FileName="samples\ChatVcl\ChatVcl.lpi">
         <BuildModes>
           <Mode Name="Default"/>

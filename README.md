@@ -288,6 +288,11 @@ marcados `deprecated` só depois que samples e testes migrarem.
 - **EchoServer / EchoClient** — console, mesmo fonte nos dois compiladores. Rode o servidor,
   depois o cliente: texto simples usa `SendText` (eco assíncrono via `OnMessage`); linhas
   começando com `?` usam `RequestText` (RPC).
+- **EchoSeguro** (`EchoSeguroServer` + `EchoSeguroClient`) — o mesmo eco, mas sobre `ptTls`
+  com mTLS: servidor exige certificado de cliente (`CaFile`), cliente apresenta o dele,
+  tráfego cifrado ponta a ponta. Usa a PKI de teste versionada em `tests/pki`; um cliente sem
+  certificado (ou um `TPipeClient` comum) é recusado antes de `OnClientConnected` disparar —
+  prova de que o mTLS não é decorativo.
 - **ChatVcl** — chat com UI (VCL no Delphi, LCL no Lazarus, mesmo fonte): uma instância é o
   servidor-hub (retransmite via `Broadcast`), as outras são clientes. Vitrine do
   `pdmMainThread` (handlers mexem na UI direto) e do `AutoReconnect`.
@@ -361,8 +366,9 @@ src/                 biblioteca (Pipes.Types, Pipes.Framing, Pipes.Transport[.Wi
                      rede: Pipes.Transport.Tcp
                      TLS: Pipes.Transport.Tls (fachada) + .Schannel / .OpenSSL (backends)
 packages/            pipes_faa.lpk (pacote Lazarus)
-samples/             EchoServer, EchoClient, ChatVcl, PdvDualScreen (Operador + Cliente),
-                     FilaImpressao, DespachoTarefas, ServicoInstavel, RpcConcorrente
+samples/             EchoServer, EchoClient, EchoSeguro (TLS + mTLS), ChatVcl,
+                     PdvDualScreen (Operador + Cliente), FilaImpressao, DespachoTarefas,
+                     ServicoInstavel, RpcConcorrente
 tests/               Unit + Integration (DUnitX e FPCUnit, espelhados)
 tests/pki/           PKI de TESTE versionada, sem valor de seguranca (ver LEIA-ME)
 docs/ARQUITETURA.md  arquitetura completa (wire format, ciclo de vida das threads, racional)
