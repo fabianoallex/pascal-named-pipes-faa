@@ -246,9 +246,14 @@ Todos os handles com `FILE_FLAG_OVERLAPPED`; nenhuma chamada síncrona blocante.
 | `src/Pipes.Transport.pas` | `TPipeEndpoint`/`TPipeListener` abstratos (Read/Write/Accept interrompíveis + CloseAbort) |
 | `src/Pipes.Transport.Windows.pas` | Named Pipe overlapped (`{$IFDEF PIPES_WINDOWS}`) |
 | `src/Pipes.Transport.Posix.pas` | UDS + fpPoll + self-pipe (`{$IFDEF PIPES_POSIX}`) |
+| `src/Pipes.Transport.Tcp.pas` | socket TCP nos dois OS (`ptTcp`), keepalive |
+| `src/Pipes.Transport.Tls.pas` | fachada `ptTls`: embrulha um endpoint TCP numa sessão TLS |
+| `src/Pipes.Transport.Schannel.pas` | backend TLS via SSPI (`{$IFDEF PIPES_SCHANNEL}`) |
+| `src/Pipes.Transport.OpenSSL.pas` | backend TLS via OpenSSL (`{$IFDEF PIPES_OPENSSL}`) |
 | `src/Pipes.Server.pas` | `TPipeServer` + acceptor + conexões |
 | `src/Pipes.Client.pas` | `TPipeClient` + reconexão |
 | `tests/Unit`, `tests/Integration` | DUnit (Delphi) + fpcunit (FPC), layout espelhado do pascal-amqp-faa |
+| `tests/pki/` | PKI de **teste** versionada (sem valor de segurança; ver `LEIA-ME.md`) |
 | `samples/` | echo console; chat VCL/LCL |
 
 ## 7. Milestones
@@ -264,6 +269,36 @@ Todos os handles com `FILE_FLAG_OVERLAPPED`; nenhuma chamada síncrona blocante.
 | M6 | Avançados | Request-Reply, Broadcast, AutoReconnect, pdmMainThread + guarda | sonnet + revisão opus |
 | M7 | Integração | echo, N clientes concorrentes, queda abrupta, stress de Stop sob tráfego — dois OS | sonnet |
 | M8 | Samples/docs | echo console + chat VCL/LCL + README | haiku |
+
+### Milestones posteriores (fora do plano original)
+
+O `ptTcp` e o `ptTls` vieram depois do M8, quando surgiu o caso de uso de PDVs de loja
+conversando com a retaguarda sobre VPN — cenário em que "IPC local" deixa de bastar e
+aparecem dois problemas que o desenho original não tinha: conexão ociosa morrendo em
+silêncio (keepalive) e listener exposto sem controle de acesso do SO (TLS/mTLS).
+
+| # | Milestone | Conteúdo |
+|---|-----------|----------|
+| T0 | Base TLS | adaptador `TPipeEndpoint`⇄`TStream`, cliente TLS |
+| T1 | Handshake fora do accept | negociação na reader thread da conexão, não no loop de accept |
+| T2 | Servidor Schannel | `AcceptSecurityContext`, credencial INBOUND, PFX |
+| T3 | Servidor OpenSSL | equivalente no POSIX |
+| T4 | mTLS | OpenSSL (`SSL_VERIFY_PEER` + `FAIL_IF_NO_PEER_CERT`) e Schannel (validação manual da cadeia) |
+| T5 | `ptTls` na API pública | enum, `TlsOptions`, timeout de handshake, suíte e docs |
+
+**Por que a validação de cadeia do Schannel é manual.** `hRootStore` +
+`ASC_REQ_MUTUAL_AUTH` **não** validam a cadeia do cliente: o Schannel apenas *exige* que
+ele apresente um certificado e entrega esse certificado à aplicação — decidir se a cadeia
+é confiável é dela. Uma versão anterior deste código assumiu o contrário e aceitou um
+certificado de CA desconhecida. `TPipeSchannelServerStream.VerifyClientChain` faz o
+trabalho em quatro passos, sendo o decisivo comparar a **raiz** da cadeia construída, byte
+a byte, com a CA configurada: um cliente pode montar uma cadeia íntegra com a própria CA
+auto-assinada, e nesse caso o único defeito é "raiz desconhecida" — que é exatamente o
+defeito que toda PKI privada tem e que o servidor precisa tolerar para o cliente legítimo
+funcionar.
+
+O caso de teste que guarda isso é o do certificado **auto-assinado**, não o de outra CA: o
+segundo é reprovado antes, por cadeia incompleta.
 
 Dependências: `M0 → M1 → M2 → (M3 ‖ M4) → M5 → M6 → M7 → M8`. Desenvolvimento começa no
 Windows (máquina atual); M4 e a metade Linux do M7 validam via FPC em CI ou máquina alvo.

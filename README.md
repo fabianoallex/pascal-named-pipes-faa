@@ -64,7 +64,72 @@ funcionam. `TCP_NODELAY` é ligado (o atraso do Nagle penalizaria muito `Request
 
 > **Segurança:** diferente de `ptLocal`, `ptTcp` **não** herda controle de acesso do SO
 > (ACL do Windows, permissão de arquivo do UDS). Um listener em `0.0.0.0` aceita qualquer
-> um que alcance a porta — autenticar é responsabilidade da aplicação.
+> um que alcance a porta — autenticar é responsabilidade da aplicação. É esse buraco que
+> `ptTls` fecha.
+
+### TLS (`ptTls`)
+
+`ptTls` é o mesmo socket TCP com TLS por cima: mesmo formato de `Address`, mesmas
+garantias de threading. O que muda é que o tráfego é cifrado e que o par pode ser
+autenticado por certificado.
+
+```pascal
+Srv := TPipeServer.Create('0.0.0.0:5000', ptTls);
+Srv.TlsOptions.CertFile := 'srv.pfx';        // PFX no Windows/Schannel
+Srv.TlsOptions.CertPassword := 'senha';
+Srv.Listen;
+
+Cli := TPipeClient.Create('servidor.empresa:5000', ptTls);
+Cli.Connect(5000);
+```
+
+As credenciais são lidas **uma vez**, no `Listen`/`Connect`: mudá-las com o componente
+ativo levanta `EPipeError` em vez de aceitar em silêncio uma configuração sem efeito.
+Erro de senha ou de arquivo aparece já no `Listen`, e não quando o primeiro cliente
+conectar.
+
+#### mTLS (autenticar o cliente)
+
+Preencher `CaFile` **no servidor** liga mTLS: o cliente passa a ser obrigado a apresentar
+um certificado que encadeie até aquela CA. Quem não apresentar — ou apresentar de outra CA
+— é recusado, e `OnClientConnected` nunca dispara para ele.
+
+```pascal
+Srv.TlsOptions.CaFile := 'ca.pem';   // liga mTLS
+Cli.TlsOptions.CertFile := 'pdv-001.pfx';
+Cli.TlsOptions.CertPassword := 'senha';
+```
+
+Esse é o desenho pensado para o caso de PDVs de loja sobre VPN: o certificado, e não o IP
+de origem, é o que diz quem é quem.
+
+#### O que muda entre os backends
+
+O backend é escolhido em **tempo de compilação** (ver `src/pipes.inc`): Schannel (SSPI
+nativo) é o padrão no Windows; OpenSSL é opt-in com `-dPIPES_OPENSSL`, e é o único no
+Linux. Três diferenças que importam na configuração:
+
+| | Schannel (Windows) | OpenSSL |
+|---|---|---|
+| Formato do certificado | `CertFile` = PFX (cert + chave juntos), `CertPassword` | `CertFile` = PEM, `KeyFile` = PEM da chave |
+| `CaFile` no **servidor** | CA dos certificados de cliente (mTLS) | idem |
+| `CaFile` no **cliente** | **ignorado** — o Windows valida contra o trust store do SO | CA usada para validar o servidor |
+
+A última linha é a pegadinha: uma PKI privada cujo certificado não esteja no trust store
+do Windows faz o *cliente* Schannel rejeitar o servidor mesmo com `CaFile` preenchido. Ou
+se instala a CA na máquina, ou se usa o backend OpenSSL.
+
+#### Prazo do handshake
+
+O handshake tem prazo próprio, `PIPE_TLS_HANDSHAKE_TIMEOUT_DEFAULT` (15 s), ajustável por
+`TlsOptions.HandshakeTimeoutMs`. Sem ele, quem abrisse o TCP e nunca mandasse o
+`ClientHello` prenderia uma thread do servidor para sempre — algumas dezenas de conexões
+meia-abertas derrubariam o serviço sem enviar um byte útil. O prazo vale **só** durante a
+negociação: depois dela a conexão volta a poder ficar ociosa à vontade, e quem cuida de
+par morto ali é o keepalive.
+
+`HandshakeTimeoutMs = 0` significa *o padrão*, não "sem prazo" — desligar exige
+`PIPE_TLS_HANDSHAKE_NO_TIMEOUT` explícito.
 
 ### Keepalive (`KeepAliveSeconds`)
 
@@ -154,6 +219,8 @@ requisitos do seu projeto (ou use `lazbuild --add-package-link packages\pipes_fa
 ```pascal
 TPipeBase (abstrata)
   Address, Transport, KeepAliveSeconds, Active, DispatchMode, MaxMessageSize
+  TlsOptions: TPipeTlsConfig             // só usado em ptTls; lido no Listen/Connect
+    CertFile, CertPassword, KeyFile, CaFile, VerifyPeer, HandshakeTimeoutMs
   OnMessage: TPipeMessageEvent;  OnError: TPipeErrorEvent
 
 TPipeServer
@@ -172,7 +239,7 @@ TPipeClient
   Connected; AutoReconnect; ReconnectDelayMs; MaxReconnectAttempts
   OnConnected/OnDisconnected: TPipeConnectionEvent
 
-Exceções: EPipeError > EPipeClosed | EPipeTimeout | EPipeProtocol
+Exceções: EPipeError > EPipeClosed | EPipeTimeout | EPipeProtocol | EPipeTls
 ```
 
 ### Compatibilidade com a API anterior
@@ -234,22 +301,42 @@ marcados `deprecated` só depois que samples e testes migrarem.
   docker run --rm -v "$PWD:/work" debian:bookworm bash -c '
     apt-get update -qq && apt-get install -y -qq fpc >/dev/null
     cd /work/tests/Integration/fpc
-    fpc -MDelphi -Sh -B -Fu../../../src -FU/tmp -o/tmp/t PipesIntegrationTestsFpc.lpr
+    fpc -MDelphi -Sh -B -Fu../../../src -Fi../../../src -FU/tmp -o/tmp/t \
+      PipesIntegrationTestsFpc.lpr
     /tmp/t --all --format=plain'
   ```
 
+  (`-Fi` é necessário desde que os testes passaram a incluir `pipes.inc`, para enxergar
+  quais backends o build tem.)
+
 A suíte de integração inclui stress de encerramento (Stop sob flood < 2 s), detector de
 vazamento de handle/fd em quedas abruptas repetidas e correlação RPC sob concorrência.
+
+### Testes de TLS
+
+O fixture `TPipeTlsTests` só existe se o build tiver backend TLS — no Linux, portanto, só
+com `-dPIPES_OPENSSL`. Cinco dos oito testes são de **recusa** (cliente sem certificado,
+de outra CA, auto-assinado, mudo no handshake): é a metade que prova que existe
+autenticação, e não só que o caminho feliz funciona.
+
+As credenciais vêm de [`tests/pki/`](tests/pki/LEIA-ME.md) — uma PKI de teste versionada
+no repositório de propósito, **sem valor de segurança**. Um scanner de segredos vai
+apontá-la; o apontamento está certo quanto ao fato e errado quanto ao risco. A alternativa
+de gerá-la no `Setup` com `openssl` foi descartada porque, onde não houvesse `openssl`, os
+testes de TLS sumiriam — e teste de segurança que some em silêncio é pior que teste
+ausente. A ausência da PKI **falha**, não pula.
 
 ## Estrutura
 
 ```
 src/                 biblioteca (Pipes.Types, Pipes.Framing, Pipes.Transport[.Windows|.Posix],
                      Pipes.Base, Pipes.Server, Pipes.Client, Pipes.Threading, pipes.inc)
+                     TLS: Pipes.Transport.Tls (fachada) + .Schannel / .OpenSSL (backends)
 packages/            pipes_faa.lpk (pacote Lazarus)
 samples/             EchoServer, EchoClient, ChatVcl, PdvDualScreen (Operador + Cliente),
                      FilaImpressao, DespachoTarefas, ServicoInstavel, RpcConcorrente
 tests/               Unit + Integration (DUnitX e FPCUnit, espelhados)
+tests/pki/           PKI de TESTE versionada, sem valor de seguranca (ver LEIA-ME)
 docs/ARQUITETURA.md  arquitetura completa (wire format, ciclo de vida das threads, racional)
 Pipes.groupproj      grupo de projetos Delphi    Pipes.lpg  grupo Lazarus
 ```
