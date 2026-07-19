@@ -2,7 +2,7 @@
 
 {$I pipes.inc}
 
-{ Transporte TLS (amqps://) via SChannel nativo do Windows (SSPI).
+{ Backend TLS do ptTls via SChannel nativo do Windows (SSPI).
 
   Motivação de design (ver plano/CLAUDE): TLS SEM dependências externas — nada de
   DLLs de OpenSSL para distribuir/manter. Usa o SChannel do próprio Windows

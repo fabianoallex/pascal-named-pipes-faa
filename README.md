@@ -4,10 +4,17 @@
 > apenas um dos transportes suportados — a API antiga segue funcionando (ver
 > [Compatibilidade](#compatibilidade-com-a-api-anterior)).
 
-Biblioteca multiplataforma de **IPC local** para **Delphi 12+ (Win64)** e
+Biblioteca multiplataforma de **comunicação entre processos** para **Delphi 12+ (Win64)** e
 **FPC 3.2.2 / Lazarus (Linux x86_64 e ARM64)**, com uma única base de código e uma API de
 alto nível que abstrai completamente as chamadas nativas do sistema operacional.
-O transporte local usa Named Pipes no Windows e Unix Domain Sockets no Linux.
+
+A mesma API atende três alcances, trocando uma property:
+
+| `Transport` | Alcance | Por baixo |
+|---|---|---|
+| `ptLocal` (padrão) | mesma máquina | Named Pipe (Windows) / Unix Domain Socket (Linux) |
+| `ptTcp` | rede | socket TCP, com keepalive ligado por padrão |
+| `ptTls` | rede não confiável | o mesmo TCP com TLS, e mTLS opcional por certificado |
 
 ```pascal
 // Servidor
@@ -48,6 +55,7 @@ TPipeServer.Create('meu_app');                  // ptLocal (padrão)
 TPipeServer.Create('meu_app', ptLocal);         // idem, explícito
 TPipeServer.Create('0.0.0.0:5000', ptTcp);      // TCP
 TPipeClient.Create('192.168.0.10:5000', ptTcp);
+TPipeServer.Create('0.0.0.0:5000', ptTls);      // TCP + TLS (credenciais em TlsOptions)
 ```
 
 O enum nomeia **alcance**, não mecanismo: `ptLocal` é "o melhor IPC local deste SO" —
@@ -139,7 +147,9 @@ esperando para sempre. Em IPC local isso não existe: a morte do processo par se
 o pipe.
 
 Por isso `ptTcp` liga keepalive TCP por padrão, com **20 s** de ociosidade
-(`PIPES_DEFAULT_KEEPALIVE_SECONDS`). `ptLocal` ignora a property.
+(`PIPES_DEFAULT_KEEPALIVE_SECONDS`). `ptTls` herda a mesma configuração — é o mesmo socket
+por baixo, e o keepalive acontece na camada TCP, sem interferir na sessão TLS. `ptLocal`
+ignora a property.
 
 ```pascal
 Server.KeepAliveSeconds := 20;  // padrão
@@ -193,6 +203,11 @@ de/para UTF-8 de forma portátil.
     `Synchronize` manual e sem risco de evento pós-destroy (objeto-guarda interno).
 - **Proteção** — `MaxMessageSize` (padrão 16 MB) rejeita frames acima do limite nas duas
   pontas; magic/kind inválidos derrubam só a conexão ofensora (`EPipeProtocol` em `OnError`).
+- **TLS e mTLS** (`ptTls`) — tráfego cifrado sobre TCP, com autenticação opcional do cliente
+  por certificado: preencher `CaFile` no servidor faz quem não apresentar certificado
+  daquela CA ser recusado antes de `OnClientConnected`. Backend nativo por plataforma
+  (Schannel no Windows, OpenSSL no Linux) e prazo próprio de handshake, para que um par que
+  abra a conexão e não fale não consuma uma thread indefinidamente.
 
 ## Garantias de threading
 
@@ -209,10 +224,21 @@ de/para UTF-8 de forma portátil.
 
 ## Instalação
 
-**Delphi:** adicione `src\` ao search path (ou abra `Pipes.groupproj`). Sem dependências.
+**Delphi:** adicione `src\` ao search path (ou abra `Pipes.groupproj`).
 
 **Lazarus:** abra/compile `packages\pipes_faa.lpk` uma vez e adicione `pipes_faa` aos
 requisitos do seu projeto (ou use `lazbuild --add-package-link packages\pipes_faa.lpk`).
+
+**Dependências:** nenhuma para `ptLocal` e `ptTcp`, e nenhuma em tempo de compilação em
+nenhum caso. Para `ptTls` depende do backend:
+
+- **Schannel** (padrão no Windows): nada a instalar — é SSPI, parte do SO.
+- **OpenSSL** (`-dPIPES_OPENSSL`; único no Linux): precisa de `libssl`/`libcrypto` **na
+  máquina que roda**. Elas são carregadas dinamicamente na primeira conexão TLS, então a
+  ausência não impede compilar nem iniciar o programa — ela aparece como `EPipeTls`
+  ("OpenSSL não encontrado") na primeira conexão. Aceita as séries 3.x e 1.1. No Linux as
+  distribuições já trazem; no Windows é preciso fornecer as DLLs
+  (`libcrypto-3-x64.dll` + `libssl-3-x64.dll`, ou os equivalentes 1.1).
 
 ## API (resumo)
 
@@ -293,7 +319,8 @@ marcados `deprecated` só depois que samples e testes migrarem.
 ## Testes
 
 - Delphi: abra `Pipes.groupproj` e rode `Pipes.UnitTests` e `Pipes.IntegrationTests` (DUnitX).
-- FPC/Lazarus (Windows): `lazbuild tests\Unit\fpc\PipesUnitTestsFpc.lpi` e rode o exe com
+- FPC/Lazarus (Windows): `lazbuild tests\Unit\fpc\PipesUnitTestsFpc.lpi` e
+  `lazbuild tests\Integration\fpc\PipesIntegrationTestsFpc.lpi`; rode os exes com
   `--all --format=plain` (sem parâmetros abre a GUI de testes).
 - Linux (Docker): imagem Debian Bookworm traz o FPC 3.2.2 exato:
 
@@ -331,6 +358,7 @@ ausente. A ausência da PKI **falha**, não pula.
 ```
 src/                 biblioteca (Pipes.Types, Pipes.Framing, Pipes.Transport[.Windows|.Posix],
                      Pipes.Base, Pipes.Server, Pipes.Client, Pipes.Threading, pipes.inc)
+                     rede: Pipes.Transport.Tcp
                      TLS: Pipes.Transport.Tls (fachada) + .Schannel / .OpenSSL (backends)
 packages/            pipes_faa.lpk (pacote Lazarus)
 samples/             EchoServer, EchoClient, ChatVcl, PdvDualScreen (Operador + Cliente),

@@ -2,7 +2,7 @@
 
 {$I pipes.inc}
 
-{ Transporte TLS (amqps://) via OpenSSL (libssl/libcrypto), multiplataforma.
+{ Backend TLS do ptTls via OpenSSL (libssl/libcrypto), multiplataforma.
 
   Compilado apenas sob a diretiva PIPES_OPENSSL (opt-in, definida pelo projeto
   consumidor — nunca automática): diferente do SChannel, que é garantido existir
@@ -16,8 +16,8 @@
   carregadas DINAMICAMENTE (dlopen/LoadLibrary) na primeira conexão TLS, com
   uma lista de sonames por versão (3.x preferida, 1.1.1 aceita): o binário não
   ganha dependência de link e, se a lib não estiver instalada, o erro só
-  acontece — com mensagem clara — quando UseTls=True. Os bindings se limitam a
-  símbolos com a MESMA assinatura em 1.1.1 e 3.x.
+  acontece — com mensagem clara — na primeira conexão ptTls. Os bindings se
+  limitam a símbolos com a MESMA assinatura em 1.1.1 e 3.x.
 
   TPipeOpenSslStream é um TStream que envolve o stream de bytes crus (o
   TPipeSocketStream sobre o socket) e cifra/decifra por cima — mesmo contrato
@@ -337,7 +337,8 @@ begin
     end;
     if LSslName = '' then
       raise EPipeTls.CreateFmt(
-        'OpenSSL não encontrado (tentados: %s). Instale libssl/libcrypto ou desabilite UseTls.',
+        'OpenSSL não encontrado (tentados: %s). Instale libssl/libcrypto, ' +
+        'ou use um transporte sem TLS (ptTcp/ptLocal).',
         [LTried]);
 
     try
