@@ -35,6 +35,9 @@ type
     FSrvDiscCount: Integer;
     FCliDiscCount: Integer;
     FCliConnCount: Integer;
+    // Quantos OnClientConnected ja haviam disparado quando a PRIMEIRA
+    // mensagem chegou; -1 = nenhuma mensagem chegou ainda.
+    FConnCountAtFirstMsg: Integer;
     // Handlers ('of object'):
     procedure OnSrvMessage(Sender: TObject; AConnId: TPipeConnectionId;
       const AData: TBytes);
@@ -62,6 +65,7 @@ type
     procedure MensagemDoClienteChegaAoServidor;
     procedure ServidorRespondeAoCliente;
     procedure OrdemPreservadaComSerialized;
+    procedure ConectadoAntesDaPrimeiraMensagem;
     procedure TresClientesSimultaneos;
     procedure DisconnectDoClienteDisparaEventoNoServidor;
     procedure DisconnectClientDoServidorDerrubaCliente;
@@ -92,6 +96,7 @@ procedure TPipeEndToEndTests.SetUp;
 begin
   inherited;
   FLock := TCriticalSection.Create;
+  FConnCountAtFirstMsg := -1;
   FServerTexts := TStringList.Create;
   FClientTexts := TStringList.Create;
   FLastConnId := 0;
@@ -128,6 +133,8 @@ procedure TPipeEndToEndTests.OnSrvMessage(Sender: TObject;
 begin
   FLock.Enter;
   try
+    if FServerTexts.Count = 0 then
+      FConnCountAtFirstMsg := PipeAtomicGet(FConnectedCount);
     FServerTexts.Add(PipeUtf8Decode(AData));
   finally
     FLock.Leave;
@@ -258,6 +265,20 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+procedure TPipeEndToEndTests.ConectadoAntesDaPrimeiraMensagem;
+begin
+  // Guarda a ordem documentada: no pdmSerialized, OnClientConnected vem ANTES
+  // do primeiro OnMessage da conexao. Quem enfileira os dois e a mesma reader
+  // thread, nesta ordem — o teste existe porque o despacho do connected ja
+  // morou na thread de accept, e mover isso poderia inverter a ordem sem que
+  // nenhum outro teste percebesse.
+  OpenPair(pdmSerialized);
+  FClient.SendText('primeira');
+  AssertTrue('mensagem nao chegou', WaitCount(FSrvMsgCount, 1, 3000));
+  AssertEquals('OnClientConnected devia ter disparado antes do primeiro OnMessage',
+    1, FConnCountAtFirstMsg);
 end;
 
 procedure TPipeEndToEndTests.OrdemPreservadaComSerialized;

@@ -220,6 +220,14 @@ var
   LFrame: TPipeFrame;
 begin
   try
+    // Negociacao (TLS do lado servidor) AQUI, nao no Accept: presa nesta
+    // thread, ela afeta so esta conexao. Um par que trave no meio nao impede
+    // o servidor de aceitar os outros.
+    FConn.FEndpoint.Handshake;
+    // So depois de negociar o cliente conta como conectado — com mTLS e' o
+    // ponto em que ele esta autenticado. Handshake que falha nunca dispara
+    // OnClientConnected: cai direto no except como qualquer outra queda.
+    FConn.FServer.DispatchConnEvent(FConn.FServer.FOnClientConnected, FConn.Id);
     while True do
     begin
       LFrame := PipeReadFrame(FConn.FStream, FConn.FServer.MaxMessageSize);
@@ -432,9 +440,14 @@ begin
     DispatchError(0, 'conexao recusada: MaxClients atingido');
     Exit;
   end;
-  // Conectado antes do reader partir: no pdmSerialized, OnClientConnected
-  // fica garantidamente ANTES do primeiro OnMessage desta conexao.
-  DispatchConnEvent(FOnClientConnected, LId);
+  // OnClientConnected NAO e' despachado aqui: quem faz isso e' a reader thread,
+  // depois do Handshake do endpoint (ver TPipeServerReaderThread.Execute). A
+  // ordem "OnClientConnected antes do primeiro OnMessage desta conexao" segue
+  // garantida no pdmSerialized, porque quem enfileira os dois e' a MESMA
+  // thread, nesta ordem.
+  //
+  // Tudo o que roda aqui e' na thread de ACCEPT e precisa continuar rapido e
+  // sem IO: e' o que impede um cliente lento de barrar os demais.
   LConn.StartReader;
 end;
 

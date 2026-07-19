@@ -27,6 +27,15 @@ type
   { Uma conexao bidirecional estabelecida (lado cliente ou lado servidor). }
   TPipeEndpoint = class
   public
+    /// Conclui a negociacao que o endpoint exigir antes do primeiro Read/Write
+    /// (hoje so o TLS do lado servidor). Vazio nos transportes que nao
+    /// negociam nada, que e' o caso de todos os locais e do TCP puro.
+    ///
+    /// Existe para tirar o handshake da thread de accept: quem chama e' a
+    /// reader thread DA CONEXAO, entao um par que trave no meio da negociacao
+    /// prende so a si mesmo. Feito no Accept, prenderia o loop de accept
+    /// inteiro e um unico cliente ruim derrubaria o servidor para todos.
+    procedure Handshake; virtual;
     /// Le ate ACount bytes (bloqueia ate haver pelo menos 1); devolve quantos
     /// leu (1..ACount). EPipeClosed se o par encerrou ou CloseAbort foi chamado.
     function Read(var ABuffer; ACount: Integer): Integer; virtual; abstract;
@@ -102,6 +111,13 @@ uses
 {$ELSE}
   Pipes.Transport.Posix;
 {$ENDIF}
+
+{ TPipeEndpoint }
+
+procedure TPipeEndpoint.Handshake;
+begin
+  // Nada a negociar por padrao.
+end;
 
 { TPipeEndpointStream }
 

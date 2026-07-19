@@ -34,6 +34,9 @@ type
     FSrvDiscCount: Integer;
     FCliDiscCount: Integer;
     FCliConnCount: Integer;
+    // Quantos OnClientConnected ja haviam disparado quando a PRIMEIRA
+    // mensagem chegou; -1 = nenhuma mensagem chegou ainda.
+    FConnCountAtFirstMsg: Integer;
     // Handlers ('of object'):
     procedure OnSrvMessage(Sender: TObject; AConnId: TPipeConnectionId;
       const AData: TBytes);
@@ -61,6 +64,7 @@ type
     [Test] procedure MensagemDoClienteChegaAoServidor;
     [Test] procedure ServidorRespondeAoCliente;
     [Test] procedure OrdemPreservadaComSerialized;
+    [Test] procedure ConectadoAntesDaPrimeiraMensagem;
     [Test] procedure TresClientesSimultaneos;
     [Test] procedure DisconnectDoClienteDisparaEventoNoServidor;
     [Test] procedure DisconnectClientDoServidorDerrubaCliente;
@@ -96,6 +100,7 @@ end;
 procedure TPipeEndToEndTests.SetUp;
 begin
   FLock := TCriticalSection.Create;
+  FConnCountAtFirstMsg := -1;
   FServerTexts := TStringList.Create;
   FClientTexts := TStringList.Create;
   FLastConnId := 0;
@@ -131,6 +136,8 @@ procedure TPipeEndToEndTests.OnSrvMessage(Sender: TObject;
 begin
   FLock.Enter;
   try
+    if FServerTexts.Count = 0 then
+      FConnCountAtFirstMsg := PipeAtomicGet(FConnectedCount);
     FServerTexts.Add(PipeUtf8Decode(AData));
   finally
     FLock.Leave;
@@ -261,6 +268,20 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+procedure TPipeEndToEndTests.ConectadoAntesDaPrimeiraMensagem;
+begin
+  // Guarda a ordem documentada: no pdmSerialized, OnClientConnected vem ANTES
+  // do primeiro OnMessage da conexao. Quem enfileira os dois e a mesma reader
+  // thread, nesta ordem — o teste existe porque o despacho do connected ja
+  // morou na thread de accept, e mover isso poderia inverter a ordem sem que
+  // nenhum outro teste percebesse.
+  OpenPair(pdmSerialized);
+  FClient.SendText('primeira');
+  Assert.IsTrue(WaitCount(FSrvMsgCount, 1, 3000), 'mensagem nao chegou');
+  Assert.AreEqual(1, FConnCountAtFirstMsg,
+    'OnClientConnected devia ter disparado antes do primeiro OnMessage');
 end;
 
 procedure TPipeEndToEndTests.OrdemPreservadaComSerialized;
