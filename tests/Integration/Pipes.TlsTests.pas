@@ -42,6 +42,8 @@ type
     FErroEvt: TEvent;   // sinalizado quando o servidor reporta um erro de conexao
     FRecebido: string;
     FErroServidor: string;
+    FCliConnCount: Integer; // atomico: quantas vezes o CLIENTE conectou
+    FCliDiscCount: Integer; // atomico: quantas vezes o CLIENTE desconectou
     procedure OnServerMsg(Sender: TObject; AConnId: TPipeConnectionId;
       const AData: TBytes);
     procedure OnClientMsg(Sender: TObject; AConnId: TPipeConnectionId;
@@ -49,6 +51,11 @@ type
     procedure OnClientConnected(Sender: TObject; AConnId: TPipeConnectionId);
     procedure OnServerError(Sender: TObject; AConnId: TPipeConnectionId;
       const AMsg: string);
+    // Lado CLIENTE (distinto de OnClientConnected, que e' o servidor
+    // reconhecendo o cliente): usado so' pelo teste de AutoReconnect, para
+    // contar quantas vezes o proprio cliente completou um Connect/handshake.
+    procedure OnClienteConectou(Sender: TObject; AConnId: TPipeConnectionId);
+    procedure OnClienteDesconectou(Sender: TObject; AConnId: TPipeConnectionId);
   public
     constructor Create(const AAddress: string);
     destructor Destroy; override;
@@ -73,6 +80,11 @@ type
     function EsperaErroServidor(ATimeoutMs: Integer): Boolean;
     /// Round-trip completo (eco). False se nao voltou no prazo.
     function Eco(const ATexto: string; ATimeoutMs: Integer): Boolean;
+    /// True se o cliente completou Connect/handshake AVezes vezes no prazo
+    /// (contador cumulativo, nao reseta). Usado pelo teste de AutoReconnect.
+    function EsperaClienteConectou(AVezes: Integer; ATimeoutMs: Integer): Boolean;
+    /// Analogo para OnDisconnected do cliente.
+    function EsperaClienteDesconectou(AVezes: Integer; ATimeoutMs: Integer): Boolean;
   end;
 
   [TestFixture]
@@ -89,6 +101,8 @@ type
     // --- caminho feliz ---
     [Test] procedure Tls_RoundTripCifrado;
     [Test] procedure Mtls_ClienteComCertDaCa_Conecta;
+    // --- reconexao ---
+    [Test] procedure Mtls_AutoReconnect_RefazHandshakeAposQueda;
     // --- validacao do servidor pelo cliente (default seguro) ---
     [Test] procedure Tls_ClienteValidaServidorPorPadrao_Recusa;
     // --- recusa (o que de fato prova que ha autenticacao) ---
@@ -193,6 +207,8 @@ begin
   FServer.OnClientConnected := OnClientConnected;
   FServer.OnError := OnServerError;
   FClient.OnMessage := OnClientMsg;
+  FClient.OnConnected := OnClienteConectou;
+  FClient.OnDisconnected := OnClienteDesconectou;
 end;
 
 destructor TTlsHarness.Destroy;
@@ -224,6 +240,18 @@ procedure TTlsHarness.OnClientConnected(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
   FConnected.SetEvent;
+end;
+
+procedure TTlsHarness.OnClienteConectou(Sender: TObject;
+  AConnId: TPipeConnectionId);
+begin
+  PipeAtomicInc(FCliConnCount);
+end;
+
+procedure TTlsHarness.OnClienteDesconectou(Sender: TObject;
+  AConnId: TPipeConnectionId);
+begin
+  PipeAtomicInc(FCliDiscCount);
 end;
 
 procedure TTlsHarness.OnServerError(Sender: TObject;
@@ -317,6 +345,28 @@ begin
   Result := (FEcho.WaitFor(ATimeoutMs) = wrSignaled) and (FRecebido = ATexto);
 end;
 
+function TTlsHarness.EsperaClienteConectou(AVezes: Integer;
+  ATimeoutMs: Integer): Boolean;
+var
+  LDeadline: UInt64;
+begin
+  LDeadline := PipeTickMs + ATimeoutMs;
+  while (PipeAtomicGet(FCliConnCount) < AVezes) and (PipeTickMs < LDeadline) do
+    Sleep(5);
+  Result := PipeAtomicGet(FCliConnCount) >= AVezes;
+end;
+
+function TTlsHarness.EsperaClienteDesconectou(AVezes: Integer;
+  ATimeoutMs: Integer): Boolean;
+var
+  LDeadline: UInt64;
+begin
+  LDeadline := PipeTickMs + ATimeoutMs;
+  while (PipeAtomicGet(FCliDiscCount) < AVezes) and (PipeTickMs < LDeadline) do
+    Sleep(5);
+  Result := PipeAtomicGet(FCliDiscCount) >= AVezes;
+end;
+
 { TPipeTlsTests }
 
 procedure TPipeTlsTests.SetUp;
@@ -357,6 +407,55 @@ begin
   AssertTrue('servidor nao autenticou o cliente legitimo',
     FHarness.ClienteAutenticado(5000));
   AssertTrue('eco nao voltou integro', FHarness.Eco('mtls ok', 5000));
+end;
+
+procedure TPipeTlsTests.Mtls_AutoReconnect_RefazHandshakeAposQueda;
+var
+  LErro: string;
+  LOk: Boolean;
+  LDeadline: UInt64;
+begin
+  // TPipeTlsConfig le as credenciais UMA vez, no Connect (comentario no
+  // cabecalho da classe, Pipes.Base.pas) — o risco especifico do AutoReconnect
+  // e' reusar algum estado da conexao anterior em vez de refazer o handshake
+  // do zero: se acontecesse, o cliente poderia reconectar sem reapresentar o
+  // certificado. O guarda disso e' o proprio Eco no final: so' volta cifrado
+  // se o handshake da RECONEXAO realmente aconteceu.
+  FHarness.Listen(Pki('ca_cert.pem')); // mTLS ligado
+  FHarness.Client.AutoReconnect := True;
+  FHarness.Client.ReconnectDelayMs := 300;
+
+  LOk := FHarness.TryConnect('cli', LErro);
+  AssertTrue('primeira conexao mTLS falhou: ' + LErro, LOk);
+  AssertTrue('primeira conexao nao confirmada pelo proprio cliente',
+    FHarness.EsperaClienteConectou(1, 3000));
+  AssertTrue('servidor nao autenticou a primeira conexao',
+    FHarness.ClienteAutenticado(3000));
+
+  FHarness.Server.Stop; // derruba o cliente
+  AssertTrue('queda nao notificada ao cliente',
+    FHarness.EsperaClienteDesconectou(1, 5000));
+
+  FHarness.Server.Listen; // "restart" do servidor no mesmo endereco/credenciais
+  AssertTrue('cliente nao reconectou sozinho (AutoReconnect)',
+    FHarness.EsperaClienteConectou(2, 10000));
+
+  // Contrato do AutoReconnect (igual ao teste equivalente em texto claro,
+  // Pipes.EndToEndTests): um Eco pode pegar uma janela de churn entre a
+  // reconexao de TCP e o handshake TLS concluir — o chamador re-tenta.
+  LDeadline := PipeTickMs + 5000;
+  LOk := False;
+  while PipeTickMs < LDeadline do
+  begin
+    if FHarness.Eco('depois da reconexao mtls', 300) then
+    begin
+      LOk := True;
+      Break;
+    end;
+    Sleep(50);
+  end;
+  AssertTrue('eco pos-reconexao nao voltou — handshake da reconexao falhou ' +
+    'ou nao aconteceu', LOk);
 end;
 
 procedure TPipeTlsTests.Tls_ClienteValidaServidorPorPadrao_Recusa;
