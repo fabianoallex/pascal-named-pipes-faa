@@ -66,6 +66,8 @@ type
     // FPC 'string' e' AnsiString — o cast direto nao existiria.
     FTargetName: UnicodeString; // SNI / nome para validação
     FVerifyPeer: Boolean;
+    FClientCert: Pointer;  // mTLS: certificado a apresentar (do chamador)
+    FCaStore: THandle;     // raiz confiavel alternativa (do chamador)
     FCredValid: Boolean;
     FCtxtValid: Boolean;
     // buffer de plaintext já decifrado, aguardando consumo por Read
@@ -86,8 +88,12 @@ type
     /// inicializa campos SEM negociar. O lado servidor usa isto porque negocia
     /// depois, na reader thread da conexao.
     constructor CreateDeferred(AUnderlying: TStream);
+    /// ACertContext <> nil faz o cliente APRESENTAR esse certificado (mTLS).
+    /// ACaStore <> 0 usa essa CA como raiz confiavel para validar o servidor
+    /// (PKI propria, cujo certificado nao esta no store da maquina).
     constructor Create(AUnderlying: TStream; const ATargetName: string;
-      AVerifyPeer: Boolean);
+      AVerifyPeer: Boolean; ACertContext: Pointer = nil;
+      ACaStore: THandle = 0);
     destructor Destroy; override;
     function Read(var Buffer; Count: Longint): Longint; override;
     function Write(const Buffer; Count: Longint): Longint; override;
@@ -107,13 +113,18 @@ type
   TPipeSchannelServerStream = class(TPipeSchannelStream)
   private
     FCertContext: Pointer; // PCCERT_CONTEXT; a POSSE fica com o chamador
+    FCaStore: THandle;     // raiz das CAs de cliente (mTLS); 0 = sem mTLS
     FNegotiated: Boolean;
     procedure AcquireServerCred;
     procedure DoServerHandshake;
   public
     /// ACertContext continua sendo do chamador: varias conexoes compartilham
     /// o mesmo certificado do servidor, entao esta classe nao o libera.
-    constructor Create(AUnderlying: TStream; ACertContext: Pointer);
+    /// ACaStore <> 0 LIGA mTLS: o cliente passa a ser obrigado a apresentar
+    /// certificado encadeado ate uma CA desse store. A posse do store, como a
+    /// do certificado, fica com o chamador.
+    constructor Create(AUnderlying: TStream; ACertContext: Pointer;
+      ACaStore: THandle);
     /// Idempotente. Levanta EPipeTls se a negociacao falhar.
     procedure Negotiate;
   end;
@@ -123,6 +134,11 @@ type
 function PipeSchannelLoadPfx(const AFileName, APassword: string): Pointer;
 /// Libera o que PipeSchannelLoadPfx devolveu. Aceita nil.
 procedure PipeSchannelFreeCert(ACertContext: Pointer);
+/// Le uma CA em PEM e devolve um store de memoria com ela, para usar como
+/// raiz confiavel (hRootStore). PEM para nao divergir do backend OpenSSL.
+function PipeSchannelLoadCaStore(const AFileName: string): THandle;
+/// Libera o que PipeSchannelLoadCaStore devolveu. Aceita 0.
+procedure PipeSchannelFreeCaStore(AStore: THandle);
 
 {$ENDIF PIPES_WINDOWS}
 
@@ -248,6 +264,10 @@ const
   PKCS_7_ASN_ENCODING      = $10000;
   CRYPT_EXPORTABLE         = 1;
   CERT_KEY_PROV_INFO_PROP_ID = 2;
+  CERT_STORE_PROV_MEMORY   = 2;
+  CERT_STORE_ADD_ALWAYS    = 4;
+  CRYPT_STRING_BASE64HEADER = 3; // PEM: base64 entre -----BEGIN/END-----
+  ASC_REQ_MUTUAL_AUTH      = $00000002;
 
 type
   TCryptDataBlob = record
@@ -275,6 +295,20 @@ function CertFreeCertificateContext(pCertContext: Pointer): BOOL; stdcall;
   external 'crypt32.dll' name 'CertFreeCertificateContext';
 function CertCloseStore(hCertStore: THandle; dwFlags: DWORD): BOOL; stdcall;
   external 'crypt32.dll' name 'CertCloseStore';
+function CertOpenStore(lpszStoreProvider: PAnsiChar; dwEncodingType: DWORD;
+  hCryptProv: THandle; dwFlags: DWORD; pvPara: Pointer): THandle; stdcall;
+  external 'crypt32.dll' name 'CertOpenStore';
+function CertCreateCertificateContext(dwCertEncodingType: DWORD;
+  pbCertEncoded: Pointer; cbCertEncoded: DWORD): Pointer; stdcall;
+  external 'crypt32.dll' name 'CertCreateCertificateContext';
+function CertAddCertificateContextToStore(hCertStore: THandle;
+  pCertContext: Pointer; dwAddDisposition: DWORD;
+  ppStoreContext: Pointer): BOOL; stdcall;
+  external 'crypt32.dll' name 'CertAddCertificateContextToStore';
+function CryptStringToBinaryA(pszString: PAnsiChar; cchString: DWORD;
+  dwFlags: DWORD; pbBinary: Pointer; var pcbBinary: DWORD;
+  pdwSkip, pdwFlags: Pointer): BOOL; stdcall;
+  external 'crypt32.dll' name 'CryptStringToBinaryA';
 
 function AcquireCredentialsHandleW(pszPrincipal, pszPackage: PWideChar;
   fCredentialUse: ULONG; pvLogonID, pAuthData, pGetKeyFn, pvGetKeyArgument: Pointer;
@@ -332,11 +366,14 @@ begin
 end;
 
 constructor TPipeSchannelStream.Create(AUnderlying: TStream;
-  const ATargetName: string; AVerifyPeer: Boolean);
+  const ATargetName: string; AVerifyPeer: Boolean; ACertContext: Pointer;
+  ACaStore: THandle);
 begin
   CreateDeferred(AUnderlying);
   FTargetName := UnicodeString(ATargetName);
   FVerifyPeer := AVerifyPeer;
+  FClientCert := ACertContext;
+  FCaStore := ACaStore;
   // Se AcquireCred/DoHandshake levantarem, o Delphi chama o destrutor
   // automaticamente — que libera credencial/contexto (guardados por
   // FCredValid/FCtxtValid) e o stream de baixo. Nada de cleanup manual aqui
@@ -363,15 +400,29 @@ end;
 procedure TPipeSchannelStream.AcquireCred;
 var
   LCred: TSChannelCred;
+  LClientCertArray: array[0..0] of Pointer;
   LStatus: SECURITY_STATUS;
 begin
   FillChar(LCred, SizeOf(LCred), 0);
   LCred.dwVersion := SCHANNEL_CRED_VERSION;
   if FVerifyPeer then
-    LCred.dwFlags := SCH_CRED_AUTO_CRED_VALIDATION or SCH_CRED_NO_DEFAULT_CREDS
+    LCred.dwFlags := SCH_CRED_AUTO_CRED_VALIDATION
   else
     LCred.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
-      SCH_CRED_NO_SERVERNAME_CHECK or SCH_CRED_NO_DEFAULT_CREDS;
+      SCH_CRED_NO_SERVERNAME_CHECK;
+  if FClientCert <> nil then
+  begin
+    // mTLS. NAO somar SCH_CRED_NO_DEFAULT_CREDS aqui: essa flag proibe o
+    // SChannel de apresentar credencial, e o certificado seria ignorado em
+    // silencio — o servidor recusaria por "cliente nao mandou certificado".
+    LClientCertArray[0] := FClientCert;
+    LCred.cCreds := 1;
+    LCred.paCred := @LClientCertArray[0];
+  end
+  else
+    LCred.dwFlags := LCred.dwFlags or SCH_CRED_NO_DEFAULT_CREDS;
+  if FCaStore <> 0 then
+    LCred.hRootStore := FCaStore;
   // grbitEnabledProtocols = 0: deixa o SChannel escolher (TLS 1.2/1.3).
 
   LStatus := AcquireCredentialsHandleW(nil, UNISP_NAME, SECPKG_CRED_OUTBOUND,
@@ -814,16 +865,96 @@ begin
     CertFreeCertificateContext(ACertContext);
 end;
 
+function PipeSchannelLoadCaStore(const AFileName: string): THandle;
+var
+  LStream: TFileStream;
+  LPem: AnsiString;
+  LDer: TBytes;
+  LDerLen: DWORD;
+  LCert: Pointer;
+begin
+  Result := 0;
+  if not FileExists(AFileName) then
+    raise EPipeTls.CreateFmt('CA nao encontrada: %s', [AFileName]);
+  LStream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(LPem, LStream.Size);
+    if Length(LPem) > 0 then
+      LStream.ReadBuffer(LPem[1], Length(LPem));
+  finally
+    LStream.Free;
+  end;
+
+  // A CA vem em PEM (mesmo formato do backend OpenSSL, para a configuracao
+  // nao mudar de forma entre plataformas); o crypt32 quer DER. O
+  // CRYPT_STRING_BASE64HEADER cuida das linhas -----BEGIN/END-----.
+  LDerLen := 0;
+  if not CryptStringToBinaryA(PAnsiChar(LPem), Length(LPem),
+       CRYPT_STRING_BASE64HEADER, nil, LDerLen, nil, nil) then
+    raise EPipeTls.CreateFmt('%s nao parece PEM valido (erro %d)',
+      [AFileName, GetLastError]);
+  SetLength(LDer, LDerLen);
+  if not CryptStringToBinaryA(PAnsiChar(LPem), Length(LPem),
+       CRYPT_STRING_BASE64HEADER, @LDer[0], LDerLen, nil, nil) then
+    raise EPipeTls.CreateFmt('falha decodificando %s (erro %d)',
+      [AFileName, GetLastError]);
+
+  LCert := CertCreateCertificateContext(
+    X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @LDer[0], LDerLen);
+  if LCert = nil then
+    raise EPipeTls.CreateFmt('%s nao e um certificado valido (erro %d)',
+      [AFileName, GetLastError]);
+  try
+    Result := CertOpenStore(PAnsiChar(CERT_STORE_PROV_MEMORY), 0, 0, 0, nil);
+    if Result = 0 then
+      raise EPipeTls.CreateFmt('CertOpenStore(memory) falhou (erro %d)',
+        [GetLastError]);
+    if not CertAddCertificateContextToStore(Result, LCert,
+         CERT_STORE_ADD_ALWAYS, nil) then
+    begin
+      CertCloseStore(Result, 0);
+      Result := 0;
+      raise EPipeTls.CreateFmt('nao foi possivel adicionar %s ao store (erro %d)',
+        [AFileName, GetLastError]);
+    end;
+  finally
+    CertFreeCertificateContext(LCert); // o store ficou com a sua referencia
+  end;
+end;
+
+procedure PipeSchannelFreeCaStore(AStore: THandle);
+begin
+  if AStore <> 0 then
+    CertCloseStore(AStore, 0);
+end;
+
 { TPipeSchannelServerStream }
 
 constructor TPipeSchannelServerStream.Create(AUnderlying: TStream;
-  ACertContext: Pointer);
+  ACertContext: Pointer; ACaStore: THandle);
 begin
   CreateDeferred(AUnderlying);
   if ACertContext = nil then
     raise EPipeTls.Create('servidor TLS exige certificado');
+  if ACaStore <> 0 then
+    // FALHA FECHADA, de proposito. Uma versao anterior deste codigo assumia
+    // que hRootStore + ASC_REQ_MUTUAL_AUTH bastavam para o SChannel validar a
+    // cadeia do cliente. NAO bastam: o SChannel apenas EXIGE que o cliente
+    // apresente um certificado e entrega esse certificado a aplicacao — quem
+    // decide se a cadeia e' confiavel e' ela. Na pratica, aquela versao aceitou
+    // um certificado de CA desconhecida numa sonda de teste.
+    //
+    // Autenticacao que aceita qualquer certificado e' pior do que nenhuma,
+    // porque parece existir. Ate a validacao manual estar implementada
+    // (SECPKG_ATTR_REMOTE_CERT_CONTEXT + CertGetCertificateChain +
+    // CertVerifyCertificateChainPolicy contra ACaStore), pedir mTLS aqui e'
+    // erro, nao um modo degradado.
+    raise EPipeTls.Create('mTLS ainda nao implementado no backend SChannel: ' +
+      'a validacao da cadeia do certificado de cliente precisa ser feita ' +
+      'explicitamente (use o backend OpenSSL, ou nao configure CaFile)');
   FCertContext := ACertContext;
-  FVerifyPeer := False; // sem mTLS ainda: o cliente nao apresenta certificado
+  FCaStore := ACaStore;
+  FVerifyPeer := ACaStore <> 0; // mTLS ligado quando ha CA de clientes
 end;
 
 procedure TPipeSchannelServerStream.Negotiate;
@@ -846,8 +977,13 @@ begin
   LCertArray[0] := FCertContext;
   LCred.cCreds := 1;
   LCred.paCred := @LCertArray[0];
-  // Sem validacao de cliente: mTLS e T4. Aqui o servidor so se apresenta.
   LCred.dwFlags := SCH_CRED_NO_SYSTEM_MAPPER;
+  if FCaStore <> 0 then
+    // Com hRootStore o proprio SChannel valida a cadeia do certificado do
+    // cliente contra esta CA durante o handshake — sem isso seria preciso
+    // pegar o SECPKG_ATTR_REMOTE_CERT_CONTEXT e chamar CertGetCertificateChain
+    // + CertVerifyCertificateChainPolicy na mao.
+    LCred.hRootStore := FCaStore;
   // grbitEnabledProtocols = 0: o SChannel escolhe (TLS 1.2/1.3).
 
   LStatus := AcquireCredentialsHandleW(nil, UNISP_NAME, SECPKG_CRED_INBOUND,
@@ -869,6 +1005,7 @@ var
   LCtxPtr: PCtxtHandle;
   LReadMore: Boolean;
   LExtra: Integer;
+  LReq: ULONG;
 begin
   // Diferenca central em relacao ao cliente: o servidor NUNCA fala primeiro.
   // Nao ha chamada inicial sem entrada — espera-se o ClientHello.
@@ -901,7 +1038,12 @@ begin
     else
       LCtxPtr := nil;
 
-    LStatus := AcceptSecurityContext(@FCred, LCtxPtr, @LInDesc, ACCEPT_REQ,
+    // MUTUAL_AUTH so entra com mTLS: sem ele o SChannel nem pede o
+    // certificado ao cliente.
+    LReq := ACCEPT_REQ;
+    if FCaStore <> 0 then
+      LReq := LReq or ASC_REQ_MUTUAL_AUTH;
+    LStatus := AcceptSecurityContext(@FCred, LCtxPtr, @LInDesc, LReq,
       SECURITY_NATIVE_DREP, @FCtxt, @LOutDesc, @LAttr, nil);
 
     // Token de saida pendente (ate em SEC_E_OK pode haver): envia.

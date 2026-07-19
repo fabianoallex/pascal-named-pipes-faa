@@ -78,6 +78,10 @@ type
     {$ENDIF}
     {$IFDEF PIPES_SCHANNEL}
     FServerTls: TPipeSchannelServerStream;
+    // Credenciais do CLIENTE, liberadas por este endpoint (no servidor elas
+    // pertencem ao listener, que as compartilha entre conexoes).
+    FClientCert: Pointer;
+    FClientCaStore: THandle;
     {$ENDIF}
   public
     /// ATargetName e' o nome usado para SNI e para validar o certificado
@@ -93,7 +97,7 @@ type
     /// backend: no Schannel um PCCERT_CONTEXT (ACertContext); no OpenSSL os
     /// caminhos do certificado e da chave PEM.
     constructor CreateServer(AInner: TPipeEndpoint; ACertContext: Pointer;
-      const AOptions: TPipeTlsOptions);
+      ACaStore: THandle; const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     procedure Handshake; override;
     function Read(var ABuffer; ACount: Integer): Integer; override;
@@ -108,10 +112,11 @@ type
   private
     FInner: TPipeListener;
     FCertContext: Pointer;  // Schannel: PCCERT_CONTEXT (desta classe)
+    FCaStore: THandle;      // Schannel: CA de clientes p/ mTLS (desta classe)
     FOptions: TPipeTlsOptions;
   public
     constructor Create(AInner: TPipeListener; ACertContext: Pointer;
-      const AOptions: TPipeTlsOptions);
+      ACaStore: THandle; const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     function Accept: TPipeEndpoint; override;
     procedure Close; override;
@@ -158,8 +163,28 @@ begin
   FTls := TPipeOpenSslStream.Create(LRaw, ATargetName, AOptions);
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
-  LRaw := TPipeEndpointStream.Create(AInner);
-  FTls := TPipeSchannelStream.Create(LRaw, ATargetName, AOptions.VerifyPeer);
+  // Resolve as credenciais antes de criar o stream: erro de senha/arquivo
+  // aparece aqui, com o nome do arquivo, e nao como falha generica de
+  // handshake mais adiante.
+  FClientCert := nil;
+  FClientCaStore := 0;
+  if AOptions.CertFile <> '' then
+    FClientCert := PipeSchannelLoadPfx(AOptions.CertFile,
+      AOptions.CertPassword);
+  try
+    if AOptions.CaFile <> '' then
+      FClientCaStore := PipeSchannelLoadCaStore(AOptions.CaFile);
+    LRaw := TPipeEndpointStream.Create(AInner);
+    FTls := TPipeSchannelStream.Create(LRaw, ATargetName, AOptions.VerifyPeer,
+      FClientCert, FClientCaStore);
+  except
+    // O stream nao chegou a existir; estas credenciais sao nossas.
+    PipeSchannelFreeCert(FClientCert);
+    FClientCert := nil;
+    PipeSchannelFreeCaStore(FClientCaStore);
+    FClientCaStore := 0;
+    raise;
+  end;
   {$ENDIF}
   {$IFNDEF PIPES_TLS}
   raise EPipeTls.Create('build sem backend TLS: compile com PIPES_OPENSSL');
@@ -167,7 +192,8 @@ begin
 end;
 
 constructor TPipeTlsEndpoint.CreateServer(AInner: TPipeEndpoint;
-  ACertContext: Pointer; const AOptions: TPipeTlsOptions);
+  ACertContext: Pointer; ACaStore: THandle;
+  const AOptions: TPipeTlsOptions);
 var
   LRaw: TPipeEndpointStream;
 begin
@@ -179,7 +205,7 @@ begin
   FTls := FServerSsl;
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
-  FServerTls := TPipeSchannelServerStream.Create(LRaw, ACertContext);
+  FServerTls := TPipeSchannelServerStream.Create(LRaw, ACertContext, ACaStore);
   FTls := FServerTls;
   {$ENDIF}
   {$IFNDEF PIPES_TLS}
@@ -208,6 +234,10 @@ begin
   // protegido la) e libera o TPipeEndpointStream. O endpoint TCP e' nosso.
   FTls.Free;
   FInner.Free;
+  {$IFDEF PIPES_SCHANNEL}
+  PipeSchannelFreeCert(FClientCert);
+  PipeSchannelFreeCaStore(FClientCaStore);
+  {$ENDIF}
   inherited;
 end;
 
@@ -256,11 +286,13 @@ end;
 { TPipeTlsListener }
 
 constructor TPipeTlsListener.Create(AInner: TPipeListener;
-  ACertContext: Pointer; const AOptions: TPipeTlsOptions);
+  ACertContext: Pointer; ACaStore: THandle;
+  const AOptions: TPipeTlsOptions);
 begin
   inherited Create;
   FInner := AInner;
   FCertContext := ACertContext;
+  FCaStore := ACaStore;
   FOptions := AOptions;
 end;
 
@@ -269,6 +301,7 @@ begin
   FInner.Free;
   {$IFDEF PIPES_SCHANNEL}
   PipeSchannelFreeCert(FCertContext); // aceita nil
+  PipeSchannelFreeCaStore(FCaStore);  // aceita 0
   {$ENDIF}
   inherited;
 end;
@@ -281,7 +314,8 @@ begin
   if LTcp = nil then
     Exit(nil); // listener fechado
   // Sem handshake aqui de proposito: esta chamada roda na thread de accept.
-  Result := TPipeTlsEndpoint.CreateServer(LTcp, FCertContext, FOptions);
+  Result := TPipeTlsEndpoint.CreateServer(LTcp, FCertContext, FCaStore,
+    FOptions);
 end;
 
 procedure TPipeTlsListener.Close;
@@ -295,8 +329,10 @@ function TlsPipeCreateListener(const AAddress: string;
 var
   LTcp: TPipeListener;
   LCert: Pointer;
+  LCaStore: THandle;
 begin
   LCert := nil;
+  LCaStore := 0;
   {$IFDEF PIPES_OPENSSL}
   // OpenSSL le os arquivos PEM na hora da negociacao; nada a resolver aqui
   // alem de validar que foram informados.
@@ -304,9 +340,16 @@ begin
     raise EPipeTls.Create('servidor TLS exige certificado e chave PEM');
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
-  // Schannel resolve o PFX UMA vez: erro de senha/arquivo aparece agora, no
+  // Schannel resolve PFX e CA UMA vez: erro de senha/arquivo aparece agora, no
   // Listen, e nao so quando o primeiro cliente conectar.
   LCert := PipeSchannelLoadPfx(AOptions.CertFile, AOptions.CertPassword);
+  try
+    if AOptions.CaFile <> '' then
+      LCaStore := PipeSchannelLoadCaStore(AOptions.CaFile);
+  except
+    PipeSchannelFreeCert(LCert);
+    raise;
+  end;
   {$ENDIF}
   {$IFNDEF PIPES_TLS}
   raise EPipeTls.Create('build sem backend TLS: compile com PIPES_OPENSSL');
@@ -315,11 +358,13 @@ begin
     LTcp := TcpPipeCreateListener(AAddress, AKeepAliveSeconds);
   except
     {$IFDEF PIPES_SCHANNEL}
-    PipeSchannelFreeCert(LCert); // o listener nao chegou a assumir a posse
+    // O listener nao chegou a assumir a posse destas credenciais.
+    PipeSchannelFreeCert(LCert);
+    PipeSchannelFreeCaStore(LCaStore);
     {$ENDIF}
     raise;
   end;
-  Result := TPipeTlsListener.Create(LTcp, LCert, AOptions);
+  Result := TPipeTlsListener.Create(LTcp, LCert, LCaStore, AOptions);
 end;
 
 end.
