@@ -95,6 +95,7 @@ type
     [Test] procedure Mtls_ClienteSemCert_Recusado;
     [Test] procedure Mtls_ClienteDeOutraCa_Recusado;
     [Test] procedure Mtls_ClienteAutoAssinado_Recusado;
+    [Test] procedure Mtls_ClienteDeCaGemea_Recusado;
     [Test] procedure Handshake_ClienteMudo_EstouraNoPrazo;
     // --- configuracao ---
     [Test] procedure Tls_ListenSemCredenciais_Falha;
@@ -428,6 +429,31 @@ begin
     'nao esta sendo comparada com a CA configurada',
     FHarness.ClienteAutenticado(2000));
   AssertFalse('GRAVE: cliente auto-assinado conseguiu trafegar',
+    FHarness.Eco('nao deveria passar', 1500));
+end;
+
+procedure TPipeTlsTests.Mtls_ClienteDeCaGemea_Recusado;
+var
+  LErro: string;
+begin
+  // Cadeia gemea 'gemea_ca_cert.pem' tem o MESMO CN e o MESMO numero de serie
+  // da CA real, so' a chave privada difere. Isso pinga o passo 3 de
+  // VerifyClientChain (Pipes.Transport.Schannel.pas): a ancora de confianca e'
+  // CertFindCertificateInStore(CERT_FIND_EXISTING, ...) sobre a raiz da cadeia
+  // do cliente, e a doc da MS nao define o criterio de "exact match".
+  //
+  // No crypt32 do Windows nativo (o alvo desta biblioteca) a comparacao e' do
+  // certificado INTEIRO, entao este teste passa trivialmente — nao ha
+  // vulnerabilidade aqui. O valor e' travar contra uma troca futura por uma
+  // comparacao mais fraca (ex.: so issuer+serial, como o Wine implementa) e
+  // versionar a evidencia da fronteira. Ver memoria ptls-estado-e-armadilhas.
+  FHarness.Listen(Pki('ca_cert.pem'));
+  FHarness.TryConnect('gemea', LErro);
+  AssertFalse('GRAVE: certificado de CA gemea (mesmo issuer+serial, chave ' +
+    'diferente) foi aceito — a raiz da cadeia esta sendo comparada so por ' +
+    'issuer+serial, nao pelo certificado inteiro',
+    FHarness.ClienteAutenticado(2000));
+  AssertFalse('GRAVE: cliente de CA gemea conseguiu trafegar',
     FHarness.Eco('nao deveria passar', 1500));
 end;
 
