@@ -39,6 +39,30 @@ type
     fica exposto a rede e a autenticacao e' responsabilidade da aplicacao. }
   TPipeTransport = (ptLocal, ptTcp);
 
+  { Credenciais e politica de validacao do ptTls. O mesmo record serve aos dois
+    lados; o que muda e' a leitura de cada campo:
+
+                  SERVIDOR                        CLIENTE
+    CertFile      certificado do servidor         certificado do cliente (mTLS;
+                  (obrigatorio)                   vazio = nao apresenta nenhum)
+    CertPassword  senha do PFX (so Schannel)      idem
+    KeyFile       chave PEM (so OpenSSL)          idem
+    CaFile        CA que assina os certificados   CA que valida o servidor
+                  de CLIENTE. Preenchido, LIGA    (vazio = usa o trust store
+                  mTLS: quem nao apresentar       do sistema)
+                  certificado valido e' recusado
+    VerifyPeer    (implicito por CaFile)          valida a cadeia do servidor
+
+    Sobre formatos: o Schannel le um PFX unico (certificado + chave), enquanto o
+    OpenSSL le PEM separados — dai CertFile/KeyFile em vez de um campo so. }
+  TPipeTlsOptions = record
+    CertFile: string;
+    CertPassword: string;
+    KeyFile: string;
+    CaFile: string;
+    VerifyPeer: Boolean;
+  end;
+
   TPipeMessageEvent = procedure(Sender: TObject; AConnId: TPipeConnectionId;
     const AData: TBytes) of object;
   /// Request-reply no servidor: o retorno em AReply vira o frame de resposta

@@ -78,6 +78,7 @@ type
     // ASCII; IDN exigiria punycode do chamador).
     FTargetName: AnsiString; // SNI / nome para validação
     FVerifyPeer: Boolean;
+    FOptions: TPipeTlsOptions; // credenciais/politica (ver TPipeTlsOptions)
     function DrainBioOut: TBytes;    // esvazia FBioOut (chamar com FLock)
     procedure SendRaw(const AData: TBytes); // envia tudo (SEM FLock)
     procedure FlushBioOut;           // DrainBioOut+SendRaw; só handshake/shutdown
@@ -91,7 +92,7 @@ type
     /// depois, na reader thread da conexao).
     constructor CreateDeferred(AUnderlying: TStream);
     constructor Create(AUnderlying: TStream; const ATargetName: string;
-      AVerifyPeer: Boolean);
+      const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     function Read(var Buffer; Count: Longint): Longint; override;
     function Write(const Buffer; Count: Longint): Longint; override;
@@ -110,16 +111,14 @@ type
     e' Negotiate, chamada pela reader thread da conexao. }
   TPipeOpenSslServerStream = class(TPipeOpenSslStream)
   private
-    FCertFile: AnsiString;
-    FKeyFile: AnsiString;
+    FOptions: TPipeTlsOptions;
     FNegotiated: Boolean;
     procedure SetupServerSsl;
   public
-    /// ACertFile/AKeyFile em PEM. Diferente do Windows (que usa PFX unico), o
-    /// OpenSSL le certificado e chave separados — formato nativo do mundo
-    /// POSIX, e o que openssl(1) gera por padrao.
+    /// Le CertFile/KeyFile (PEM) como identidade do servidor. Se CaFile estiver
+    /// preenchido, exige e valida certificado de CLIENTE contra essa CA (mTLS).
     constructor Create(AUnderlying: TStream;
-      const ACertFile, AKeyFile: string);
+      const AOptions: TPipeTlsOptions);
     /// Idempotente. Levanta EPipeTls se a negociacao falhar.
     procedure Negotiate;
   end;
@@ -194,6 +193,9 @@ const
   TLS1_2_VERSION                  = $0303;
   // <openssl/ssl.h>: formato do arquivo de chave privada.
   SSL_FILETYPE_PEM = 1;
+  // Sem FAIL_IF_NO_PEER_CERT o servidor PEDE o certificado mas aceita quem
+  // nao mandar nenhum — mTLS que nao autentica nada.
+  SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 2;
 
   X509_V_OK = 0;
 
@@ -208,6 +210,8 @@ var
   p_SSL_CTX_use_PrivateKey_file: function(ACtx: Pointer; AFile: PAnsiChar;
     AType: Integer): Integer; cdecl;
   p_SSL_CTX_check_private_key: function(ACtx: Pointer): Integer; cdecl;
+  p_SSL_CTX_load_verify_locations: function(ACtx: Pointer;
+    ACAfile, ACApath: PAnsiChar): Integer; cdecl;
   p_SSL_CTX_new: function(AMeth: Pointer): Pointer; cdecl;
   p_SSL_CTX_free: procedure(ACtx: Pointer); cdecl;
   p_SSL_CTX_ctrl: function(ACtx: Pointer; ACmd: Integer; ALarg: TSslLong;
@@ -358,6 +362,8 @@ begin
         SslMustGet(LSsl, 'SSL_CTX_use_PrivateKey_file', LSslName);
       p_SSL_CTX_check_private_key :=
         SslMustGet(LSsl, 'SSL_CTX_check_private_key', LSslName);
+      p_SSL_CTX_load_verify_locations :=
+        SslMustGet(LSsl, 'SSL_CTX_load_verify_locations', LSslName);
       p_SSL_do_handshake := SslMustGet(LSsl, 'SSL_do_handshake', LSslName);
       p_SSL_read := SslMustGet(LSsl, 'SSL_read', LSslName);
       p_SSL_write := SslMustGet(LSsl, 'SSL_write', LSslName);
@@ -426,6 +432,9 @@ end;
 
 { TPipeOpenSslStream }
 
+// (declaracao adiantada: usada por SetupSsl do cliente, definida adiante)
+procedure LoadIdentity(ACtx: Pointer; const AOptions: TPipeTlsOptions); forward;
+
 constructor TPipeOpenSslStream.CreateDeferred(AUnderlying: TStream);
 begin
   inherited Create;
@@ -435,11 +444,12 @@ begin
 end;
 
 constructor TPipeOpenSslStream.Create(AUnderlying: TStream;
-  const ATargetName: string; AVerifyPeer: Boolean);
+  const ATargetName: string; const AOptions: TPipeTlsOptions);
 begin
   CreateDeferred(AUnderlying);
   FTargetName := AnsiString(ATargetName);
-  FVerifyPeer := AVerifyPeer;
+  FOptions := AOptions;
+  FVerifyPeer := AOptions.VerifyPeer;
   // Se algo abaixo levantar, o destrutor (auto-chamado) libera o que existir
   // (handles guardados em campos) e o stream de baixo — nada de cleanup manual
   // aqui (seria double-free). Mesmo contrato do TPipeSchannelStream.
@@ -474,6 +484,8 @@ begin
 end;
 
 procedure TPipeOpenSslStream.SetupSsl;
+var
+  LTmp: AnsiString;
 begin
   FCtx := p_SSL_CTX_new(p_TLS_client_method());
   if FCtx = nil then
@@ -485,13 +497,26 @@ begin
   if FVerifyPeer then
   begin
     p_SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
+    if FOptions.CaFile <> '' then
+    begin
+      // CA propria (frota com PKI interna): o certificado do servidor nao
+      // esta no trust store do sistema, e nem deveria estar.
+      LTmp := AnsiString(FOptions.CaFile);
+      if p_SSL_CTX_load_verify_locations(FCtx, PAnsiChar(LTmp), nil) <> 1 then
+        raise EPipeTls.CreateFmt('nao foi possivel carregar a CA %s (%s)',
+          [FOptions.CaFile, LastSslErrorText]);
+    end
     // Trust store do sistema (ex.: /etc/ssl/certs no Linux).
-    if p_SSL_CTX_set_default_verify_paths(FCtx) <> 1 then
+    else if p_SSL_CTX_set_default_verify_paths(FCtx) <> 1 then
       raise EPipeTls.CreateFmt('SSL_CTX_set_default_verify_paths falhou (%s)',
         [LastSslErrorText]);
   end
   else
     p_SSL_CTX_set_verify(FCtx, SSL_VERIFY_NONE, nil);
+
+  // mTLS: o cliente so apresenta certificado se tiver um configurado.
+  if FOptions.CertFile <> '' then
+    LoadIdentity(FCtx, FOptions);
 
   // Ordem importa pro cleanup do destrutor: BIOs antes do SSL (se SSL_new
   // falhar, FSsl=nil e o destrutor libera os BIOs); SSL_set_bio logo em
@@ -784,17 +809,40 @@ begin
   end;
 end;
 
+// Carrega certificado + chave num SSL_CTX. Serve aos dois lados: identidade do
+// servidor, ou certificado de cliente para mTLS.
+procedure LoadIdentity(ACtx: Pointer; const AOptions: TPipeTlsOptions);
+var
+  LCert, LKey: AnsiString;
+begin
+  LCert := AnsiString(AOptions.CertFile);
+  LKey := AnsiString(AOptions.KeyFile);
+  if p_SSL_CTX_use_certificate_chain_file(ACtx, PAnsiChar(LCert)) <> 1 then
+    raise EPipeTls.CreateFmt('nao foi possivel carregar o certificado %s (%s)',
+      [AOptions.CertFile, LastSslErrorText]);
+  if p_SSL_CTX_use_PrivateKey_file(ACtx, PAnsiChar(LKey),
+       SSL_FILETYPE_PEM) <> 1 then
+    raise EPipeTls.CreateFmt('nao foi possivel carregar a chave %s (%s)',
+      [AOptions.KeyFile, LastSslErrorText]);
+  // Detecta cedo o par cert/chave trocado: sem esta checagem o erro so
+  // apareceria no handshake, longe da causa.
+  if p_SSL_CTX_check_private_key(ACtx) <> 1 then
+    raise EPipeTls.CreateFmt('a chave %s nao corresponde ao certificado %s (%s)',
+      [AOptions.KeyFile, AOptions.CertFile, LastSslErrorText]);
+end;
+
 { TPipeOpenSslServerStream }
 
 constructor TPipeOpenSslServerStream.Create(AUnderlying: TStream;
-  const ACertFile, AKeyFile: string);
+  const AOptions: TPipeTlsOptions);
 begin
   CreateDeferred(AUnderlying);
-  if (ACertFile = '') or (AKeyFile = '') then
+  if (AOptions.CertFile = '') or (AOptions.KeyFile = '') then
     raise EPipeTls.Create('servidor TLS exige certificado e chave');
-  FCertFile := AnsiString(ACertFile);
-  FKeyFile := AnsiString(AKeyFile);
-  FVerifyPeer := False; // sem mTLS ainda: o cliente nao apresenta certificado
+  FOptions := AOptions;
+  // No servidor, "verificar o par" significa exigir certificado de cliente, e
+  // isso e' ligado por ter uma CA de clientes configurada.
+  FVerifyPeer := AOptions.CaFile <> '';
 end;
 
 procedure TPipeOpenSslServerStream.Negotiate;
@@ -808,6 +856,8 @@ begin
 end;
 
 procedure TPipeOpenSslServerStream.SetupServerSsl;
+var
+  LCa: AnsiString;
 begin
   FCtx := p_SSL_CTX_new(p_TLS_server_method());
   if FCtx = nil then
@@ -817,21 +867,20 @@ begin
   // Mesmo piso do lado cliente e do SChannel.
   p_SSL_CTX_ctrl(FCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, nil);
 
-  if p_SSL_CTX_use_certificate_chain_file(FCtx, PAnsiChar(FCertFile)) <> 1 then
-    raise EPipeTls.CreateFmt('nao foi possivel carregar o certificado %s (%s)',
-      [string(FCertFile), LastSslErrorText]);
-  if p_SSL_CTX_use_PrivateKey_file(FCtx, PAnsiChar(FKeyFile),
-       SSL_FILETYPE_PEM) <> 1 then
-    raise EPipeTls.CreateFmt('nao foi possivel carregar a chave %s (%s)',
-      [string(FKeyFile), LastSslErrorText]);
-  // Detecta cedo o par cert/chave trocado: sem esta checagem o erro so
-  // apareceria no handshake, longe da causa.
-  if p_SSL_CTX_check_private_key(FCtx) <> 1 then
-    raise EPipeTls.CreateFmt('a chave %s nao corresponde ao certificado %s (%s)',
-      [string(FKeyFile), string(FCertFile), LastSslErrorText]);
+  LoadIdentity(FCtx, FOptions);
 
-  // Sem validacao do par: mTLS e' T4.
-  p_SSL_CTX_set_verify(FCtx, SSL_VERIFY_NONE, nil);
+  if FOptions.CaFile <> '' then
+  begin
+    // mTLS: so entra quem apresentar certificado assinado por esta CA.
+    LCa := AnsiString(FOptions.CaFile);
+    if p_SSL_CTX_load_verify_locations(FCtx, PAnsiChar(LCa), nil) <> 1 then
+      raise EPipeTls.CreateFmt('nao foi possivel carregar a CA de clientes %s (%s)',
+        [FOptions.CaFile, LastSslErrorText]);
+    p_SSL_CTX_set_verify(FCtx,
+      SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nil);
+  end
+  else
+    p_SSL_CTX_set_verify(FCtx, SSL_VERIFY_NONE, nil);
 
   // Mesma ordem de criacao do lado cliente, pela mesma razao de cleanup.
   FBioIn := p_BIO_new(p_BIO_s_mem());

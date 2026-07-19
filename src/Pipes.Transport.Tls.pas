@@ -84,7 +84,7 @@ type
     /// (tipicamente o host de Address). AVerifyPeer=False desliga a validacao
     /// da cadeia — util so em laboratorio, nunca em producao.
     constructor Create(AInner: TPipeEndpoint; const ATargetName: string;
-      AVerifyPeer: Boolean);
+      const AOptions: TPipeTlsOptions);
     /// Lado SERVIDOR: embrulha o endpoint aceito sem negociar nada ainda. A
     /// negociacao acontece em Handshake, chamado pela reader thread — no
     /// accept, um cliente lento prenderia o servidor inteiro (ver T1).
@@ -93,7 +93,7 @@ type
     /// backend: no Schannel um PCCERT_CONTEXT (ACertContext); no OpenSSL os
     /// caminhos do certificado e da chave PEM.
     constructor CreateServer(AInner: TPipeEndpoint; ACertContext: Pointer;
-      const ACertFile, AKeyFile: string);
+      const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     procedure Handshake; override;
     function Read(var ABuffer; ACount: Integer): Integer; override;
@@ -108,11 +108,10 @@ type
   private
     FInner: TPipeListener;
     FCertContext: Pointer;  // Schannel: PCCERT_CONTEXT (desta classe)
-    FCertFile: string;      // OpenSSL: caminhos PEM
-    FKeyFile: string;
+    FOptions: TPipeTlsOptions;
   public
     constructor Create(AInner: TPipeListener; ACertContext: Pointer;
-      const ACertFile, AKeyFile: string);
+      const AOptions: TPipeTlsOptions);
     destructor Destroy; override;
     function Accept: TPipeEndpoint; override;
     procedure Close; override;
@@ -120,15 +119,14 @@ type
 
 /// Conecta via TCP e faz o handshake TLS como CLIENTE.
 function TlsPipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
-  AKeepAliveSeconds: Cardinal; AVerifyPeer: Boolean): TPipeEndpoint;
+  AKeepAliveSeconds: Cardinal;
+  const AOptions: TPipeTlsOptions): TPipeEndpoint;
 
 /// ACertFile e' um PFX com a chave privada do servidor. O handshake de cada
 /// conexao roda depois, na reader thread dela (ver TPipeEndpoint.Handshake).
-/// AKeyFile so e' usado pelo backend OpenSSL (PEM separado); no Schannel a
-/// chave vem dentro do PFX e ACertPassword e' a senha dele.
 function TlsPipeCreateListener(const AAddress: string;
   AKeepAliveSeconds: Cardinal;
-  const ACertFile, ACertPassword, AKeyFile: string): TPipeListener;
+  const AOptions: TPipeTlsOptions): TPipeListener;
 
 implementation
 
@@ -138,7 +136,7 @@ uses
 { TPipeTlsEndpoint }
 
 constructor TPipeTlsEndpoint.Create(AInner: TPipeEndpoint;
-  const ATargetName: string; AVerifyPeer: Boolean);
+  const ATargetName: string; const AOptions: TPipeTlsOptions);
 var
   LRaw: TPipeEndpointStream;
 begin
@@ -157,11 +155,11 @@ begin
   // invalido, justamente o caminho de erro que precisa funcionar).
   {$IFDEF PIPES_OPENSSL}
   LRaw := TPipeEndpointStream.Create(AInner);
-  FTls := TPipeOpenSslStream.Create(LRaw, ATargetName, AVerifyPeer);
+  FTls := TPipeOpenSslStream.Create(LRaw, ATargetName, AOptions);
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
   LRaw := TPipeEndpointStream.Create(AInner);
-  FTls := TPipeSchannelStream.Create(LRaw, ATargetName, AVerifyPeer);
+  FTls := TPipeSchannelStream.Create(LRaw, ATargetName, AOptions.VerifyPeer);
   {$ENDIF}
   {$IFNDEF PIPES_TLS}
   raise EPipeTls.Create('build sem backend TLS: compile com PIPES_OPENSSL');
@@ -169,7 +167,7 @@ begin
 end;
 
 constructor TPipeTlsEndpoint.CreateServer(AInner: TPipeEndpoint;
-  ACertContext: Pointer; const ACertFile, AKeyFile: string);
+  ACertContext: Pointer; const AOptions: TPipeTlsOptions);
 var
   LRaw: TPipeEndpointStream;
 begin
@@ -177,7 +175,7 @@ begin
   FInner := AInner; // posse assumida ja (mesma regra do construtor cliente)
   LRaw := TPipeEndpointStream.Create(AInner);
   {$IFDEF PIPES_OPENSSL}
-  FServerSsl := TPipeOpenSslServerStream.Create(LRaw, ACertFile, AKeyFile);
+  FServerSsl := TPipeOpenSslServerStream.Create(LRaw, AOptions);
   FTls := FServerSsl;
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
@@ -240,7 +238,8 @@ end;
 { --- fabricas --- }
 
 function TlsPipeConnect(const AAddress: string; ATimeoutMs: Cardinal;
-  AKeepAliveSeconds: Cardinal; AVerifyPeer: Boolean): TPipeEndpoint;
+  AKeepAliveSeconds: Cardinal;
+  const AOptions: TPipeTlsOptions): TPipeEndpoint;
 var
   LTcp: TPipeEndpoint;
   LHost: string;
@@ -251,19 +250,18 @@ begin
   LTcp := TcpPipeConnect(AAddress, ATimeoutMs, AKeepAliveSeconds);
   // Idem: TPipeTlsEndpoint.Create assume a posse de LTcp imediatamente, e o
   // destructor dele o libera se o handshake falhar. Nao ha nada a liberar aqui.
-  Result := TPipeTlsEndpoint.Create(LTcp, LHost, AVerifyPeer);
+  Result := TPipeTlsEndpoint.Create(LTcp, LHost, AOptions);
 end;
 
 { TPipeTlsListener }
 
 constructor TPipeTlsListener.Create(AInner: TPipeListener;
-  ACertContext: Pointer; const ACertFile, AKeyFile: string);
+  ACertContext: Pointer; const AOptions: TPipeTlsOptions);
 begin
   inherited Create;
   FInner := AInner;
   FCertContext := ACertContext;
-  FCertFile := ACertFile;
-  FKeyFile := AKeyFile;
+  FOptions := AOptions;
 end;
 
 destructor TPipeTlsListener.Destroy;
@@ -283,8 +281,7 @@ begin
   if LTcp = nil then
     Exit(nil); // listener fechado
   // Sem handshake aqui de proposito: esta chamada roda na thread de accept.
-  Result := TPipeTlsEndpoint.CreateServer(LTcp, FCertContext, FCertFile,
-    FKeyFile);
+  Result := TPipeTlsEndpoint.CreateServer(LTcp, FCertContext, FOptions);
 end;
 
 procedure TPipeTlsListener.Close;
@@ -294,7 +291,7 @@ end;
 
 function TlsPipeCreateListener(const AAddress: string;
   AKeepAliveSeconds: Cardinal;
-  const ACertFile, ACertPassword, AKeyFile: string): TPipeListener;
+  const AOptions: TPipeTlsOptions): TPipeListener;
 var
   LTcp: TPipeListener;
   LCert: Pointer;
@@ -303,13 +300,13 @@ begin
   {$IFDEF PIPES_OPENSSL}
   // OpenSSL le os arquivos PEM na hora da negociacao; nada a resolver aqui
   // alem de validar que foram informados.
-  if (ACertFile = '') or (AKeyFile = '') then
+  if (AOptions.CertFile = '') or (AOptions.KeyFile = '') then
     raise EPipeTls.Create('servidor TLS exige certificado e chave PEM');
   {$ENDIF}
   {$IFDEF PIPES_SCHANNEL}
   // Schannel resolve o PFX UMA vez: erro de senha/arquivo aparece agora, no
   // Listen, e nao so quando o primeiro cliente conectar.
-  LCert := PipeSchannelLoadPfx(ACertFile, ACertPassword);
+  LCert := PipeSchannelLoadPfx(AOptions.CertFile, AOptions.CertPassword);
   {$ENDIF}
   {$IFNDEF PIPES_TLS}
   raise EPipeTls.Create('build sem backend TLS: compile com PIPES_OPENSSL');
@@ -322,7 +319,7 @@ begin
     {$ENDIF}
     raise;
   end;
-  Result := TPipeTlsListener.Create(LTcp, LCert, ACertFile, AKeyFile);
+  Result := TPipeTlsListener.Create(LTcp, LCert, AOptions);
 end;
 
 end.
