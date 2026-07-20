@@ -321,6 +321,16 @@ procedure TfrmChatSeguro.CliConnected(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
   FConectouEm := Now;
+  // A lib descarta a sessao se AutoReconnect virar False durante o PipeConnect,
+  // mas nada elimina a janela: uma tentativa pode concluir no exato instante da
+  // decisao. Anunciar "conectado" depois da recusa confundiria — entao aqui a
+  // sessao residual e' nomeada pelo que ela e'.
+  if FRecusado then
+  begin
+    Log('(conexao residual de uma tentativa que ja estava em voo; ' +
+      'o hub vai derruba-la)');
+    Exit;
+  end;
   // ATENCAO ao ler isto no backend SCHANNEL: "handshake concluido" aqui NAO
   // significa "fui aceito". O servidor Schannel completa o handshake e so'
   // ENTAO valida a cadeia do certificado, entao um cliente recusado passa por

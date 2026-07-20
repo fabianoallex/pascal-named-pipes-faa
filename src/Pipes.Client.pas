@@ -409,7 +409,15 @@ begin
     on EPipeError do
       Exit; // inclui EPipeTimeout: proxima tentativa (ou desiste no teto)
   end;
-  if PipeAtomicGet(FDeliberate) <> 0 then
+  // Segunda checagem, agora com a conexao ja aberta: a flag pode ter virado
+  // DURANTE o PipeConnect. Descartar aqui e' o que impede uma sessao natimorta
+  // de ser instalada e anunciada com OnConnected — o usuario veria "conectado"
+  // depois de ja ter decidido parar de reconectar, que foi exatamente o
+  // sintoma observado no sample apos a recusa de certificado.
+  //
+  // Nao fecha a janela por completo (nada fecha: o par pode aceitar no exato
+  // instante da decisao), mas reduz a um caso raro o que antes era certo.
+  if (PipeAtomicGet(FDeliberate) <> 0) or (not FAutoReconnect) then
   begin
     LEndpoint.CloseAbort;
     LEndpoint.Free;
