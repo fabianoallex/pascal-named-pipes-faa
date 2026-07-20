@@ -162,6 +162,12 @@ inverso: derivar autorização de um nome sem que a cadeia tenha sido verificada
 `TryClientIdentity` devolve `False` quando não há identidade *verificada* — sem TLS, ou com
 TLS sem mTLS. `False` nunca significa "ainda não chegou": não há o que esperar.
 
+A identidade **sobrevive à saída do cliente**, então `OnClientDisconnected` também pode
+perguntar "quem saiu?" — sem isso um painel só conseguiria dizer "conexão 7 saiu". Ficam
+retidas as últimas `PIPES_RECENT_IDENTITIES` (256) conexões autenticadas. O motivo de não
+liberar junto com a conexão é que o evento e a limpeza vão para filas diferentes, sem
+ordem garantida entre si: amarrar a vida da identidade à limpeza seria uma corrida.
+
 > **Mudança de comportamento:** `ClientCount` e `ClientIds` passaram a contar apenas
 > conexões **estabelecidas** — aquelas para as quais `OnClientConnected` já disparou. Antes,
 > uma conexão aceita mas ainda negociando TLS já aparecia ali, o que sob mTLS significava

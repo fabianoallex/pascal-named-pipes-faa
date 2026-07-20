@@ -68,8 +68,6 @@ type
     // sera' recusado e' o que fazia o painel piscar clientes fantasmas.
     // Escrito sob FConnLock pela reader thread; lido sob FConnLock.
     FEstablished: Boolean;
-    FIdentity: TPipePeerIdentity;
-    FHasIdentity: Boolean;
     procedure AddRef;
     procedure Release; // libera o objeto quando zera
     procedure StartReader;
@@ -86,6 +84,19 @@ type
     FListener: TPipeListener;
     FAcceptor: TThread;
     FConnections: TDictionary<TPipeConnectionId, TPipeServerConnection>;
+    // Identidades dos clientes autenticados. SEPARADO de FConnections de
+    // proposito: a conexao sai do registro ANTES de OnClientDisconnected
+    // disparar (a remocao e' o ato de posse do teardown), entao um handler que
+    // perguntasse "quem saiu?" nao teria resposta se a identidade morresse
+    // junto com a conexao.
+    //
+    // Nao da' para liberar a entrada na limpeza da conexao: o evento e a
+    // limpeza vao para filas diferentes (pool de eventos x pool global) e, em
+    // pdmPool ou pdmMainThread, nao ha ordem garantida entre os dois — a
+    // identidade poderia sumir antes do handler rodar. Por isso a entrada
+    // sobrevive, e o que limita a memoria e' o teto abaixo.
+    FIdentities: TDictionary<TPipeConnectionId, TPipePeerIdentity>;
+    FIdentityOrder: TList<TPipeConnectionId>; // ordem de chegada, p/ despejo
     FConnLock: TCriticalSection;
     FNextConnId: TPipeConnectionId; // sob FConnLock
     FActive: Boolean;
@@ -142,9 +153,13 @@ type
     /// Ids dos clientes estabelecidos (mesmo criterio de ClientCount).
     function ClientIds: TArray<TPipeConnectionId>;
     /// Quem e' o cliente, segundo o certificado validado no handshake mTLS.
-    /// False quando a conexao nao existe (ou ja caiu) ou quando nao ha
-    /// identidade verificada — sem TLS, ou com TLS sem mTLS. False NUNCA
-    /// significa "ainda nao chegou": nao ha o que esperar.
+    /// False quando nao ha identidade verificada — sem TLS, ou com TLS sem
+    /// mTLS. False NUNCA significa "ainda nao chegou": nao ha o que esperar.
+    ///
+    /// Continua respondendo DEPOIS de o cliente sair, entao um handler de
+    /// OnClientDisconnected pode perguntar "quem saiu?". A identidade das
+    /// ultimas PIPES_RECENT_IDENTITIES conexoes autenticadas fica retida; alem
+    /// disso a mais antiga e' descartada.
     ///
     /// E' Try* e nao levanta como SendBytes porque o uso tipico e' varrer
     /// ClientIds e consultar cada um; entre as duas chamadas uma conexao pode
@@ -368,6 +383,8 @@ constructor TPipeServer.Create(const AAddress: string;
 begin
   inherited Create(AAddress, ATransport);
   FConnections := TDictionary<TPipeConnectionId, TPipeServerConnection>.Create;
+  FIdentities := TDictionary<TPipeConnectionId, TPipePeerIdentity>.Create;
+  FIdentityOrder := TList<TPipeConnectionId>.Create;
   FConnLock := TCriticalSection.Create;
 end;
 
@@ -378,6 +395,8 @@ begin
   except
   end;
   FConnections.Free;
+  FIdentities.Free;
+  FIdentityOrder.Free;
   FConnLock.Free;
   inherited;
 end;
@@ -714,8 +733,15 @@ begin
   try
     if LHas then
     begin
-      AConn.FIdentity := LIdentity;
-      AConn.FHasIdentity := True;
+      FIdentities.AddOrSetValue(AConn.Id, LIdentity);
+      FIdentityOrder.Add(AConn.Id);
+      // Despejo pelo mais antigo. Os ids sao monotonicos, entao a ordem de
+      // chegada e' a propria ordem da lista.
+      while FIdentityOrder.Count > PIPES_RECENT_IDENTITIES do
+      begin
+        FIdentities.Remove(FIdentityOrder[0]);
+        FIdentityOrder.Delete(0);
+      end;
     end;
     AConn.FEstablished := True;
   finally
@@ -748,12 +774,10 @@ begin
   FillChar(AIdentity, SizeOf(AIdentity), 0);
   FConnLock.Enter;
   try
-    if FConnections.TryGetValue(AConnId, LConn) and LConn.FEstablished
-       and LConn.FHasIdentity then
-    begin
-      AIdentity := LConn.FIdentity;
-      Result := True;
-    end;
+    // Nao exige conexao viva: a identidade sobrevive a saida do cliente, que
+    // e' justamente o que permite responder "quem saiu?" dentro do
+    // OnClientDisconnected.
+    Result := FIdentities.TryGetValue(AConnId, AIdentity);
   finally
     FConnLock.Leave;
   end;

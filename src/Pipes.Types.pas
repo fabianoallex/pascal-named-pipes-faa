@@ -133,6 +133,12 @@ const
   /// Teto padrao de payload por mensagem (protecao contra frame corrompido
   /// ou malicioso); ajustavel por instancia via MaxMessageSize.
   PIPES_DEFAULT_MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
+  /// Quantas identidades de clientes o servidor mantem consultaveis depois de
+  /// a conexao ter saido (ver TPipeServer.TryClientIdentity). Existe porque a
+  /// identidade precisa sobreviver ao OnClientDisconnected, e a limpeza da
+  /// conexao nao tem ordem garantida em relacao a esse evento. 256 cobre com
+  /// folga qualquer handler que consulte na hora, e custa poucos KB.
+  PIPES_RECENT_IDENTITIES = 256;
   /// Ociosidade (segundos) antes do primeiro probe de keepalive em ptTcp.
   /// 20s e' deliberadamente curto: o alvo sao conexoes sobre VPN/NAT, cujo
   /// timeout de ociosidade costuma ficar entre 30s e poucos minutos — o probe

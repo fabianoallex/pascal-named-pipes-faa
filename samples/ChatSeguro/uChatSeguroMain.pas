@@ -35,7 +35,7 @@ uses
   {$ELSE}
   Windows, Messages,
   {$ENDIF}
-  SysUtils, Classes, DateUtils, Generics.Collections,
+  SysUtils, Classes, DateUtils,
   Graphics, Controls, Forms, Dialogs, StdCtrls,
   Pipes.Types, Pipes.Framing, Pipes.Base, Pipes.Server, Pipes.Client;
 
@@ -64,12 +64,7 @@ type
     FServer: TPipeServer;
     FClient: TPipeClient;
     FPkiDir: string;
-    // Nome de cada conexao, guardado na ENTRADA. Necessario porque na saida a
-    // identidade ja nao existe: quando OnClientDisconnected dispara, a conexao
-    // ja saiu do registro do servidor e TryClientIdentity devolve False. Uma
-    // aplicacao que queira dizer "loja-001 saiu" precisa ter anotado antes —
-    // e' o padrao que este sample mostra.
-    FNomes: TDictionary<TPipeConnectionId, string>;
+
     // Instante do ultimo OnConnected do cliente. Serve para reconhecer a
     // recusa por certificado: ver CliDisconnected.
     FConectouEm: TDateTime;
@@ -124,7 +119,6 @@ var
 begin
   // Localiza tests/pki subindo a partir do executavel: o sample roda de
   // samples\ChatSeguro\Win64\Debug ou de samples/ChatSeguro no Lazarus.
-  FNomes := TDictionary<TPipeConnectionId, string>.Create;
   FPkiDir := '';
   LDir := ExtractFilePath(ParamStr(0));
   for I := 0 to 6 do
@@ -240,27 +234,18 @@ end;
 
 procedure TfrmChatSeguro.SrvConnected(Sender: TObject;
   AConnId: TPipeConnectionId);
-var
-  LNome: string;
 begin
-  LNome := NomeDe(AConnId);
-  FNomes.AddOrSetValue(AConnId, LNome); // anota para poder nomear a SAIDA
-  Log(LNome + ' entrou.');
+  Log(NomeDe(AConnId) + ' entrou.');
   AtualizaSala;
 end;
 
 procedure TfrmChatSeguro.SrvDisconnected(Sender: TObject;
   AConnId: TPipeConnectionId);
-var
-  LNome: string;
 begin
-  // NAO da' para perguntar a identidade aqui: quando este evento dispara a
-  // conexao ja saiu do registro do servidor, e TryClientIdentity devolve
-  // False. Por isso o nome vem do que foi anotado na entrada.
-  if not FNomes.TryGetValue(AConnId, LNome) then
-    LNome := 'conexao ' + IntToStr(AConnId);
-  FNomes.Remove(AConnId);
-  Log(LNome + ' saiu.');
+  // A identidade sobrevive a saida da conexao de proposito (ver
+  // TryClientIdentity), entao da' para nomear quem saiu sem a aplicacao
+  // precisar manter um cache proprio.
+  Log(NomeDe(AConnId) + ' saiu.');
   AtualizaSala;
 end;
 
@@ -403,7 +388,6 @@ procedure TfrmChatSeguro.btnDesligarClick(Sender: TObject);
 begin
   FreeAndNil(FClient); // Disconnect sincrono no destructor
   FreeAndNil(FServer); // Stop sincrono no destructor
-  FNomes.Clear;        // sala vazia: os nomes anotados nao valem mais
   lblStatus.Caption := 'parado';
   Log('desligado.');
   SetUiLigada(False);
@@ -416,8 +400,6 @@ begin
   // da lib): fechar a janela no meio do trafego e' seguro.
   FreeAndNil(FClient);
   FreeAndNil(FServer);
-  // Depois dos Free acima: os handlers ainda podiam tocar FNomes ate' aqui.
-  FreeAndNil(FNomes);
 end;
 
 end.

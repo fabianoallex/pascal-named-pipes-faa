@@ -46,6 +46,10 @@ type
     // Preenchidos DE DENTRO de OnClientConnected (ver o handler).
     FIdentityFromHandler: TPipePeerIdentity;
     FIdentityNoHandler: Boolean;
+    // Preenchidos DE DENTRO de OnClientDisconnected (ver o handler).
+    FIdentityNaSaida: TPipePeerIdentity;
+    FTinhaIdentidadeNaSaida: Boolean;
+    FSaiuEvt: TEvent;
     FErroEvt: TEvent;   // sinalizado quando o servidor reporta um erro de conexao
     FRecebido: string;
     FErroServidor: string;
@@ -56,6 +60,7 @@ type
     procedure OnClientMsg(Sender: TObject; AConnId: TPipeConnectionId;
       const AData: TBytes);
     procedure OnClientConnected(Sender: TObject; AConnId: TPipeConnectionId);
+    procedure OnClientDisconnected(Sender: TObject; AConnId: TPipeConnectionId);
     procedure OnServerError(Sender: TObject; AConnId: TPipeConnectionId;
       const AMsg: string);
     // Lado CLIENTE (distinto de OnClientConnected, que e' o servidor
@@ -74,6 +79,10 @@ type
     function CliConnCount: Integer;
     function CliDiscCount: Integer;
     property IdentityFromHandler: TPipePeerIdentity read FIdentityFromHandler;
+    property IdentityNaSaida: TPipePeerIdentity read FIdentityNaSaida;
+    property TinhaIdentidadeNaSaida: Boolean read FTinhaIdentidadeNaSaida;
+    /// True se OnClientDisconnected do servidor disparou no prazo.
+    function EsperaClienteSaiu(ATimeoutMs: Integer): Boolean;
     property IdentityNoHandler: Boolean read FIdentityNoHandler;
     /// Sobe o servidor. ACaFile <> '' liga mTLS.
     procedure Listen(const ACaFile: string);
@@ -128,6 +137,7 @@ type
     // --- identidade do par autenticado ---
     [Test] procedure Mtls_IdentidadeDoCliente_TrazCnDoCertificado;
     [Test] procedure Tls_SemMtls_NaoTemIdentidade;
+    [Test] procedure Mtls_IdentidadeDisponivelNoOnClientDisconnected;
     [Test] procedure ClientIds_NaoListaConexaoEmHandshake;
     // --- reconexao contra recusa permanente ---
     [Test] procedure Mtls_AutoReconnectRecusado_NaoViraLacoQuente;
@@ -232,11 +242,13 @@ begin
   inherited Create;
   FEcho := TEvent.Create(nil, True, False, '');
   FConnected := TEvent.Create(nil, True, False, '');
+  FSaiuEvt := TEvent.Create(nil, True, False, '');
   FErroEvt := TEvent.Create(nil, True, False, '');
   FServer := TPipeServer.Create(AAddress, ptTls);
   FClient := TPipeClient.Create(AAddress, ptTls);
   FServer.OnMessage := OnServerMsg;
   FServer.OnClientConnected := OnClientConnected;
+  FServer.OnClientDisconnected := OnClientDisconnected;
   FServer.OnError := OnServerError;
   FClient.OnMessage := OnClientMsg;
   FClient.OnConnected := OnClienteConectou;
@@ -251,6 +263,7 @@ begin
   FServer.Free;
   FEcho.Free;
   FConnected.Free;
+  FSaiuEvt.Free;
   FErroEvt.Free;
   inherited;
 end;
@@ -288,6 +301,21 @@ end;
 function TTlsHarness.CliDiscCount: Integer;
 begin
   Result := PipeAtomicGet(FCliDiscCount);
+end;
+
+procedure TTlsHarness.OnClientDisconnected(Sender: TObject;
+  AConnId: TPipeConnectionId);
+begin
+  // A pergunta que importa: "quem saiu?" — feita AQUI, quando a conexao ja
+  // saiu do registro do servidor.
+  FTinhaIdentidadeNaSaida :=
+    FServer.TryClientIdentity(AConnId, FIdentityNaSaida);
+  FSaiuEvt.SetEvent;
+end;
+
+function TTlsHarness.EsperaClienteSaiu(ATimeoutMs: Integer): Boolean;
+begin
+  Result := FSaiuEvt.WaitFor(ATimeoutMs) = wrSignaled;
 end;
 
 procedure TTlsHarness.OnClienteConectou(Sender: TObject;
@@ -692,6 +720,30 @@ begin
   AssertFalse('sem mTLS nao deveria haver identidade',
     FHarness.Server.TryClientIdentity(FHarness.LastConnId, LId));
   AssertEquals('CN deveria vir vazio', '', LId.CommonName);
+end;
+
+procedure TPipeTlsTests.Mtls_IdentidadeDisponivelNoOnClientDisconnected;
+var
+  LErro: string;
+begin
+  // A conexao sai de FConnections ANTES de OnClientDisconnected disparar — a
+  // remocao e' o ato de posse do teardown. Se a identidade morresse junto, um
+  // painel nao teria como dizer "loja-001 saiu", so' "conexao 7 saiu".
+  //
+  // Nao da' para amarrar a vida da identidade a limpeza da conexao: evento e
+  // limpeza vao para filas diferentes e nao tem ordem garantida entre si.
+  FHarness.Listen(Pki('ca_cert.pem'));
+  AssertTrue('cliente legitimo foi recusado: ' + LErro,
+    FHarness.TryConnect('cli', LErro));
+  AssertTrue('servidor nao autenticou o cliente',
+    FHarness.ClienteAutenticado(5000));
+
+  FHarness.Client.Disconnect;
+  AssertTrue('servidor nao notificou a saida', FHarness.EsperaClienteSaiu(5000));
+  AssertTrue('identidade sumiu antes do OnClientDisconnected',
+    FHarness.TinhaIdentidadeNaSaida);
+  AssertEquals('CN de quem saiu', 'pdv-loja-001',
+    FHarness.IdentityNaSaida.CommonName);
 end;
 
 procedure TPipeTlsTests.ClientIds_NaoListaConexaoEmHandshake;
