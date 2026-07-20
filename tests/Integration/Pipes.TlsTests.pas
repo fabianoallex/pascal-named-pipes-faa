@@ -40,6 +40,9 @@ type
     FEcho: TEvent;
     FConnected: TEvent;
     FLastConnId: TPipeConnectionId;
+    // Quando True, o handler de queda do CLIENTE desliga AutoReconnect — e' o
+    // padrao "recusa permanente" do sample ChatSeguro.
+    FDesligarReconexaoAoCair: Boolean;
     // Preenchidos DE DENTRO de OnClientConnected (ver o handler).
     FIdentityFromHandler: TPipePeerIdentity;
     FIdentityNoHandler: Boolean;
@@ -66,6 +69,8 @@ type
     property Server: TPipeServer read FServer;
     property Client: TPipeClient read FClient;
     property LastConnId: TPipeConnectionId read FLastConnId;
+    property DesligarReconexaoAoCair: Boolean
+      read FDesligarReconexaoAoCair write FDesligarReconexaoAoCair;
     function CliConnCount: Integer;
     function CliDiscCount: Integer;
     property IdentityFromHandler: TPipePeerIdentity read FIdentityFromHandler;
@@ -126,6 +131,7 @@ type
     [Test] procedure ClientIds_NaoListaConexaoEmHandshake;
     // --- reconexao contra recusa permanente ---
     [Test] procedure Mtls_AutoReconnectRecusado_NaoViraLacoQuente;
+    [Test] procedure AutoReconnectDesligadoNoCallback_ParaDeTentar;
     // --- configuracao ---
     [Test] procedure Tls_ListenSemCredenciais_Falha;
     [Test] procedure Tls_TrocaCertComServidorAtivo_Levanta;
@@ -293,6 +299,8 @@ procedure TTlsHarness.OnClienteDesconectou(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
   PipeAtomicInc(FCliDiscCount);
+  if FDesligarReconexaoAoCair then
+    FClient.AutoReconnect := False; // decisao tomada DE DENTRO do callback
 end;
 
 procedure TTlsHarness.OnServerError(Sender: TObject;
@@ -740,6 +748,31 @@ begin
   AssertTrue('AutoReconnect virou laco quente: ' + IntToStr(LTentativas) +
     ' eventos de conexao em 2s com ReconnectDelayMs=400',
     LTentativas < 20);
+end;
+
+procedure TPipeTlsTests.AutoReconnectDesligadoNoCallback_ParaDeTentar;
+var
+  LErro: string;
+  LAntes, LDepois: Integer;
+begin
+  // Uma aplicacao que reconhece recusa permanente desliga AutoReconnect de
+  // dentro do proprio OnDisconnected (e' o que o sample ChatSeguro faz). Isso
+  // so' funciona porque a flag e' RELIDA antes de cada tentativa: quando ela e'
+  // alterada, ReaderFinished ja decidiu reconectar — em pdmMainThread o evento
+  // nem rodou ainda, esta enfileirado para a thread da UI.
+  FHarness.Listen(Pki('ca_cert.pem'));
+  FHarness.Client.AutoReconnect := True;
+  FHarness.Client.ReconnectDelayMs := 300;
+  FHarness.DesligarReconexaoAoCair := True; // handler desliga na primeira queda
+  FHarness.TryConnect('selfsigned', LErro);
+
+  Sleep(1200);
+  LAntes := FHarness.CliConnCount;
+  Sleep(1500); // mais de 4 intervalos: se ainda tentasse, apareceria aqui
+  LDepois := FHarness.CliConnCount;
+
+  AssertEquals('depois de AutoReconnect:=False no callback nao deveria ' +
+    'haver novas conexoes', LAntes, LDepois);
 end;
 
 procedure TPipeTlsTests.Tls_ListenSemCredenciais_Falha;

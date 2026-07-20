@@ -73,6 +73,13 @@ type
     // Instante do ultimo OnConnected do cliente. Serve para reconhecer a
     // recusa por certificado: ver CliDisconnected.
     FConectouEm: TDateTime;
+    // Ja reconheceu a recusa nesta tentativa. Necessario porque desligar
+    // AutoReconnect de dentro do callback NAO cancela o que ja esta em voo:
+    // com pdmMainThread o evento e' enfileirado para a UI, entao a lib pode ja'
+    // ter reconectado mais uma ou duas vezes antes de o handler rodar. Sem
+    // esta flag a mensagem de recusa apareceria repetida, dando a impressao
+    // errada de que desligar nao funcionou.
+    FRecusado: Boolean;
     procedure Log(const S: string);
     procedure SetUiLigada(ALigada: Boolean);
     function Pki(const AFile: string): string;
@@ -264,7 +271,8 @@ var
   LQuem: string;
 begin
   LQuem := cbxIdentidade.Text;
-  FConectouEm := 0; // tentativa nova: nao herda o instante da anterior
+  FConectouEm := 0;   // tentativa nova: nao herda o instante da anterior
+  FRecusado := False; // idem para o reconhecimento de recusa
   FClient := TPipeClient.Create(edtEndereco.Text, ptTls);
   FClient.DispatchMode := pdmMainThread;
   FClient.AutoReconnect := True; // hub reiniciou? refaz o handshake sozinho
@@ -328,12 +336,17 @@ begin
   // nao queda de rede: o hub aceitou o handshake e derrubou ao reprovar o
   // certificado. Isso NAO se conserta sozinho — insistir seria martelar o
   // servidor com uma credencial que ele acabou de rejeitar.
-  if (FConectouEm > 0) and (MilliSecondsBetween(Now, FConectouEm) < 1000) then
+  if FRecusado or
+     ((FConectouEm > 0) and (MilliSecondsBetween(Now, FConectouEm) < 1000)) then
   begin
     FClient.AutoReconnect := False;
-    Log('RECUSADO pelo hub: o certificado "' + cbxIdentidade.Text +
-      '" nao foi aceito. Reconexao desligada (nao adianta insistir).');
-    lblStatus.Caption := 'recusado - troque a identidade e tente de novo';
+    if not FRecusado then
+    begin
+      FRecusado := True;
+      Log('RECUSADO pelo hub: o certificado "' + cbxIdentidade.Text +
+        '" nao foi aceito. Reconexao desligada (nao adianta insistir).');
+      lblStatus.Caption := 'recusado - troque a identidade e tente de novo';
+    end;
     Exit;
   end;
   Log('conexao caiu - AutoReconnect vai refazer o handshake...');

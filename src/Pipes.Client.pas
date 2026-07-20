@@ -391,6 +391,14 @@ begin
   WaitBetweenRetries;
   if PipeAtomicGet(FDeliberate) <> 0 then
     Exit; // Disconnect durante a espera
+  // AutoReconnect e' relido AQUI, e nao so' quando a thread foi criada. Sem
+  // isto, desliga-lo de dentro de OnDisconnected nao teria efeito sobre a
+  // tentativa ja em curso: em pdmMainThread o evento e' ENFILEIRADO para a
+  // thread da UI, entao ReaderFinished ja decidiu reconectar antes de o
+  // handler do usuario rodar. Reler no ultimo instante possivel torna
+  // "AutoReconnect := False" util de dentro do proprio callback.
+  if not FAutoReconnect then
+    Exit;
   FLastAttemptTick := PipeTickMs;
   try
     // Reconexao usa as MESMAS credenciais: um cliente que reconecta sem elas
