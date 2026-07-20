@@ -66,6 +66,8 @@ type
     property Server: TPipeServer read FServer;
     property Client: TPipeClient read FClient;
     property LastConnId: TPipeConnectionId read FLastConnId;
+    function CliConnCount: Integer;
+    function CliDiscCount: Integer;
     property IdentityFromHandler: TPipePeerIdentity read FIdentityFromHandler;
     property IdentityNoHandler: Boolean read FIdentityNoHandler;
     /// Sobe o servidor. ACaFile <> '' liga mTLS.
@@ -122,6 +124,8 @@ type
     [Test] procedure Mtls_IdentidadeDoCliente_TrazCnDoCertificado;
     [Test] procedure Tls_SemMtls_NaoTemIdentidade;
     [Test] procedure ClientIds_NaoListaConexaoEmHandshake;
+    // --- reconexao contra recusa permanente ---
+    [Test] procedure Mtls_AutoReconnectRecusado_NaoViraLacoQuente;
     // --- configuracao ---
     [Test] procedure Tls_ListenSemCredenciais_Falha;
     [Test] procedure Tls_TrocaCertComServidorAtivo_Levanta;
@@ -267,6 +271,16 @@ begin
   FIdentityNoHandler :=
     FServer.TryClientIdentity(AConnId, FIdentityFromHandler);
   FConnected.SetEvent;
+end;
+
+function TTlsHarness.CliConnCount: Integer;
+begin
+  Result := PipeAtomicGet(FCliConnCount);
+end;
+
+function TTlsHarness.CliDiscCount: Integer;
+begin
+  Result := PipeAtomicGet(FCliDiscCount);
 end;
 
 procedure TTlsHarness.OnClienteConectou(Sender: TObject;
@@ -696,6 +710,36 @@ begin
   finally
     LMudo.Free;
   end;
+end;
+
+procedure TPipeTlsTests.Mtls_AutoReconnectRecusado_NaoViraLacoQuente;
+var
+  LErro: string;
+  LTentativas: Integer;
+begin
+  // Cliente com certificado que o servidor RECUSA, e AutoReconnect ligado.
+  // A recusa nao se conserta sozinha, entao o cliente vai insistir — o que
+  // NAO pode acontecer e' insistir sem intervalo.
+  //
+  // Regressao de um bug real, visto no sample ChatSeguro: no backend SChannel
+  // o servidor completa o handshake e SO ENTAO valida a cadeia, entao o
+  // cliente via "conectado" seguido de queda imediata. Esse caminho
+  // ("conectou e caiu no mesmo instante") era tratado como SUCESSO: nao
+  // contava tentativa e nao esperava nada, girando dezenas de vezes por
+  // segundo contra um servidor que acabara de rejeitar a credencial.
+  FHarness.Listen(Pki('ca_cert.pem'));
+  FHarness.Client.AutoReconnect := True;
+  FHarness.Client.ReconnectDelayMs := 400;
+  FHarness.TryConnect('selfsigned', LErro); // recusado, aqui ou logo apos
+
+  // Em ~2s, com 400ms de intervalo, cabem ~5 tentativas. Um laco quente faria
+  // dezenas ou centenas. O teto e' folgado de proposito: o que se afirma e'
+  // "ha espacamento", nao um numero exato.
+  Sleep(2000);
+  LTentativas := FHarness.CliConnCount + FHarness.CliDiscCount;
+  AssertTrue('AutoReconnect virou laco quente: ' + IntToStr(LTentativas) +
+    ' eventos de conexao em 2s com ReconnectDelayMs=400',
+    LTentativas < 20);
 end;
 
 procedure TPipeTlsTests.Tls_ListenSemCredenciais_Falha;

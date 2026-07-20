@@ -35,7 +35,7 @@ uses
   {$ELSE}
   Windows, Messages,
   {$ENDIF}
-  SysUtils, Classes, Generics.Collections,
+  SysUtils, Classes, DateUtils, Generics.Collections,
   Graphics, Controls, Forms, Dialogs, StdCtrls,
   Pipes.Types, Pipes.Framing, Pipes.Base, Pipes.Server, Pipes.Client;
 
@@ -70,6 +70,9 @@ type
     // aplicacao que queira dizer "loja-001 saiu" precisa ter anotado antes —
     // e' o padrao que este sample mostra.
     FNomes: TDictionary<TPipeConnectionId, string>;
+    // Instante do ultimo OnConnected do cliente. Serve para reconhecer a
+    // recusa por certificado: ver CliDisconnected.
+    FConectouEm: TDateTime;
     procedure Log(const S: string);
     procedure SetUiLigada(ALigada: Boolean);
     function Pki(const AFile: string): string;
@@ -261,6 +264,7 @@ var
   LQuem: string;
 begin
   LQuem := cbxIdentidade.Text;
+  FConectouEm := 0; // tentativa nova: nao herda o instante da anterior
   FClient := TPipeClient.Create(edtEndereco.Text, ptTls);
   FClient.DispatchMode := pdmMainThread;
   FClient.AutoReconnect := True; // hub reiniciou? refaz o handshake sozinho
@@ -308,6 +312,11 @@ end;
 procedure TfrmChatSeguro.CliConnected(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
+  FConectouEm := Now;
+  // ATENCAO ao ler isto no backend SCHANNEL: "handshake concluido" aqui NAO
+  // significa "fui aceito". O servidor Schannel completa o handshake e so'
+  // ENTAO valida a cadeia do certificado, entao um cliente recusado passa por
+  // este evento e leva a queda logo depois. E' o que CliDisconnected trata.
   Log('conectado ao hub (handshake TLS concluido).');
   lblStatus.Caption := 'conectado como "' + cbxIdentidade.Text + '" (mTLS)';
 end;
@@ -315,6 +324,18 @@ end;
 procedure TfrmChatSeguro.CliDisconnected(Sender: TObject;
   AConnId: TPipeConnectionId);
 begin
+  // Sessao que morre quase junto com o OnConnected e' recusa de credencial,
+  // nao queda de rede: o hub aceitou o handshake e derrubou ao reprovar o
+  // certificado. Isso NAO se conserta sozinho — insistir seria martelar o
+  // servidor com uma credencial que ele acabou de rejeitar.
+  if (FConectouEm > 0) and (MilliSecondsBetween(Now, FConectouEm) < 1000) then
+  begin
+    FClient.AutoReconnect := False;
+    Log('RECUSADO pelo hub: o certificado "' + cbxIdentidade.Text +
+      '" nao foi aceito. Reconexao desligada (nao adianta insistir).');
+    lblStatus.Caption := 'recusado - troque a identidade e tente de novo';
+    Exit;
+  end;
   Log('conexao caiu - AutoReconnect vai refazer o handshake...');
   lblStatus.Caption := 'reconectando...';
 end;

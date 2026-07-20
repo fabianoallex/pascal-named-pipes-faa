@@ -25,7 +25,17 @@ unit Pipes.Client;
   - Reconexao: o reader que morre dispara a thread de reconexao (CAS em
     FReconnecting garante uma so); cada tentativa e' um PipeConnect com
     timeout = ReconnectDelayMs. Disconnect/Connect/Destroy esperam a
-    reconexao em curso terminar (spin em FReconnecting). }
+    reconexao em curso terminar (spin em FReconnecting).
+  - O espacamento entre tentativas vive no CLIENTE (FLastAttemptTick), nao na
+    thread de reconexao, e e' aplicado em TryReopenSession — o funil unico por
+    onde toda reabertura passa. A razao: um servidor que ACEITA e derruba em
+    seguida (mTLS no Schannel valida a cadeia depois do handshake) faz cada
+    ciclo terminar com a thread saindo e ReaderFinished criando uma NOVA. Um
+    contador por thread reiniciaria a cada ciclo e nunca espacaria nada.
+  - Consequencia disso para MaxReconnectAttempts: ele conta tentativas que
+    FALHARAM em abrir a sessao. Um par que aceita e derruba produz tentativas
+    bem-sucedidas, entao o teto nao se aplica — quem precisa desistir nesse
+    caso decide na aplicacao (ver o sample ChatSeguro). }
 
 interface
 
@@ -61,6 +71,14 @@ type
     FReconnectDelayMs: Cardinal;
     FMaxReconnectAttempts: Integer; // 0 = infinitas
     FReconnecting: Integer;         // atomico: 1 com thread de reconexao viva
+    // Manual-reset, sinalizado pelo Disconnect: acorda na hora a espera ENTRE
+    // tentativas de reconexao. Sem ele, um Sleep faria o Disconnect esperar o
+    // intervalo inteiro.
+    FReconnectAbort: TEvent;
+    // Tick da ultima tentativa de reabrir a sessao. Vive no CLIENTE, e nao na
+    // thread de reconexao, porque cada ciclo "conectou e caiu" cria uma thread
+    // NOVA (ver ReaderFinished): um contador por thread nunca acumularia.
+    FLastAttemptTick: UInt64; // 0 = nenhuma tentativa ainda
     // Chamados pelas threads internas (mesma unit):
     procedure ReaderFinished(const AError: string);
     procedure HandleFrame(const AFrame: TPipeFrame);
@@ -68,6 +86,9 @@ type
     procedure ResolveRpc(const AFrame: TPipeFrame);
     procedure FailPendingRpc;
     function TryReopenSession: Boolean; // roda na thread de reconexao
+    /// Completa o intervalo desde a ULTIMA tentativa de reabrir a sessao.
+    /// Acorda na hora se houver Disconnect.
+    procedure WaitBetweenRetries;
     procedure WaitReconnectDone;
   protected
     function GetActive: Boolean; override;
@@ -192,20 +213,31 @@ end;
 procedure TPipeReconnectThread.Execute;
 var
   LAttempts: Integer;
+  LDePe: Boolean;
 begin
   LAttempts := 0;
   while PipeAtomicGet(FClient.FDeliberate) = 0 do
   begin
+    LDePe := False;
     if FClient.TryReopenSession then
     begin
       // TryReopenSession zera FReconnecting DEPOIS de a sessao estar completa
       // (reader criado). Se a sessao nova ja caiu neste intervalo, o CAS
       // retoma o loop — sem ele a queda instantanea perderia a reconexao.
-      if (PipeAtomicGet(FClient.FDeliberate) = 0) and
-         (not FClient.FConnected) and
-         (PipeAtomicCompareExchange(FClient.FReconnecting, 1, 0) = 0) then
-        Continue;
-      Exit;
+      //
+      // "Conectou e caiu no mesmo instante" NAO e' sucesso, e conta como
+      // tentativa. O caso real e' o servidor mTLS no backend SChannel: ele
+      // completa o handshake e SO ENTAO valida a cadeia, entao um cliente com
+      // certificado recusado ve conexao estabelecida seguida de queda
+      // imediata. Tratar isso como sucesso fazia o laco girar sem espacamento
+      // e sem nunca alcancar MaxReconnectAttempts — martelando o servidor
+      // dezenas de vezes por segundo com uma credencial que ele acabou de
+      // rejeitar.
+      LDePe := not ((PipeAtomicGet(FClient.FDeliberate) = 0) and
+                    (not FClient.FConnected) and
+                    (PipeAtomicCompareExchange(FClient.FReconnecting, 1, 0) = 0));
+      if LDePe then
+        Exit; // reconectou e a sessao continua de pe
     end;
     Inc(LAttempts);
     if (FClient.FMaxReconnectAttempts > 0) and
@@ -228,6 +260,7 @@ begin
   FWriteLock := TCriticalSection.Create;
   FRpcLock := TCriticalSection.Create;
   FRpcSlots := TDictionary<UInt64, TObject>.Create;
+  FReconnectAbort := TEvent.Create(nil, True, False, ''); // manual-reset
   FReconnectDelayMs := 2000;
 end;
 
@@ -240,12 +273,28 @@ begin
   FRpcSlots.Free; // vazio: cada Request remove e libera o proprio slot
   FRpcLock.Free;
   FWriteLock.Free;
+  FReconnectAbort.Free;
   inherited;
 end;
 
 function TPipeClient.GetActive: Boolean;
 begin
   Result := FConnected;
+end;
+
+procedure TPipeClient.WaitBetweenRetries;
+var
+  LRestante: Int64;
+begin
+  if FLastAttemptTick = 0 then
+    Exit; // primeira tentativa desta reconexao: vai direto
+  LRestante := Int64(FReconnectDelayMs) -
+    (Int64(PipeTickMs) - Int64(FLastAttemptTick));
+  if LRestante <= 0 then
+    Exit; // a propria tentativa ja consumiu o intervalo
+  // Espera no evento, nao em Sleep: um Disconnect durante o intervalo acorda
+  // aqui na hora, em vez de deixar o usuario esperando o ciclo terminar.
+  FReconnectAbort.WaitFor(Cardinal(LRestante));
 end;
 
 procedure TPipeClient.WaitReconnectDone;
@@ -268,6 +317,8 @@ begin
     raise;
   end;
   FStream := TPipeEndpointStream.Create(FEndpoint);
+  FReconnectAbort.ResetEvent; // sessao nova: o abort anterior nao vale mais
+  FLastAttemptTick := 0;      // Connect explicito nao espera espacamento
   PipeAtomicSet(FDeliberate, 0);
   PipeAtomicSet(FDisconnectNotified, 0);
   FConnected := True;
@@ -280,6 +331,9 @@ var
   LHadSession: Boolean;
 begin
   PipeAtomicSet(FDeliberate, 1);
+  // Antes do WaitReconnectDone: se a thread de reconexao estiver no intervalo
+  // entre tentativas, isto a acorda em vez de deixar o Disconnect esperando.
+  FReconnectAbort.SetEvent;
   WaitReconnectDone; // depois disto, so esta thread mexe na sessao
   LHadSession := Assigned(FEndpoint);
   FConnected := False;
@@ -326,9 +380,19 @@ begin
   finally
     FWriteLock.Leave;
   end;
+  // Espacamento ANTES de cada tentativa, e nao depois: este e' o funil unico
+  // por onde toda reabertura passa, venha ela do laco da thread de reconexao
+  // ou de uma thread NOVA criada por ReaderFinished.
+  //
+  // PipeConnect ja consome ate ReconnectDelayMs quando o servidor esta fora do
+  // ar, mas quando ele responde e RECUSA a tentativa volta em milissegundos —
+  // e era esse o caso do servidor mTLS no SChannel, que aceita o handshake e
+  // so' depois valida a cadeia.
+  WaitBetweenRetries;
+  if PipeAtomicGet(FDeliberate) <> 0 then
+    Exit; // Disconnect durante a espera
+  FLastAttemptTick := PipeTickMs;
   try
-    // O proprio PipeConnect re-tenta ate ReconnectDelayMs: e' o espacamento
-    // entre tentativas (nao ha Sleep adicional).
     // Reconexao usa as MESMAS credenciais: um cliente que reconecta sem elas
     // voltaria em texto claro, ou seria recusado pelo servidor mTLS.
     LEndpoint := PipeConnect(Address, FReconnectDelayMs, Transport,

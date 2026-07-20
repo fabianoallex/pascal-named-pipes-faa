@@ -127,6 +127,19 @@ A última linha é a pegadinha: uma PKI privada cujo certificado não esteja no 
 do Windows faz o *cliente* Schannel rejeitar o servidor mesmo com `CaFile` preenchido. Ou
 se instala a CA na máquina, ou se usa o backend OpenSSL.
 
+> **Como o cliente vê uma recusa de mTLS — e por que difere por backend.** O Schannel
+> completa o handshake e **só então** entrega o certificado do cliente para a aplicação
+> validar (é o que `VerifyClientChain` faz). Consequência: um cliente recusado vê
+> `OnConnected` disparar normalmente e a conexão cair logo em seguida. No OpenSSL a
+> validação acontece dentro do handshake, então a recusa chega como falha de conexão e
+> `OnConnected` nunca dispara.
+>
+> Uma aplicação que precise distinguir "fui aceito" de "vou ser derrubado" no lado cliente
+> **não pode confiar só em `OnConnected` sob Schannel**. O padrão prático é o do sample
+> `ChatSeguro`: uma sessão que morre quase junto com o `OnConnected` é recusa de
+> credencial, não queda de rede — e aí não adianta reconectar, porque a credencial não
+> vai passar a ser aceita sozinha.
+
 #### Quem está do outro lado
 
 Sob mTLS o servidor não só valida o certificado do cliente — ele guarda quem é:
