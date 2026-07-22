@@ -1,22 +1,39 @@
 # pascal-pipes-faa
 
-Biblioteca multiplataforma de Named Pipes (IPC local) para **Delphi 12+ (Win64)** e
-**FPC 3.2.2 / Lazarus (Linux x86_64 e ARM64)**. API de alto nível que abstrai totalmente as
-chamadas nativas do SO. Arquitetura completa em `docs/ARQUITETURA.md` — leia antes de
-implementar qualquer milestone.
+> Antes `pascal-named-pipes-faa`. Renomeado quando o Named Pipe do Windows deixou de ser o
+> único transporte — ver `Transport` abaixo e `README.md`, seção "Compatibilidade com a API
+> anterior".
+
+Biblioteca multiplataforma de comunicação entre processos para **Delphi 12+ (Win64)** e
+**FPC 3.2.2 / Lazarus (Linux x86_64 e ARM64)**. API de alto nível (`TPipeServer`/
+`TPipeClient`) que abstrai totalmente as chamadas nativas do SO, com três alcances
+selecionados pela property `Transport`: `ptLocal` (Named Pipe/UDS, padrão), `ptTcp`
+(rede) e `ptTls` (rede não confiável, com mTLS opcional). Racional de design completo em
+`docs/ARQUITETURA.md` (histórico de *por quê*); estado atual da API com exemplos em
+`README.md` (fonte de verdade para *o que existe hoje*) — leia os dois antes de
+implementar qualquer milestone novo.
 
 ## Decisões arquiteturais (fechadas — não rediscutir sem o usuário)
 
-- **Backend Windows:** Named Pipes reais (`CreateNamedPipe`/`ConnectNamedPipe`), modo byte
-  (`PIPE_TYPE_BYTE`), sempre com `FILE_FLAG_OVERLAPPED`. Nunca I/O síncrono blocante.
-- **Backend Linux:** Unix Domain Sockets (`AF_UNIX`) — equivalente semântico do Named Pipe
-  do Windows. FIFOs (`mkfifo`) estão FORA do escopo v1 (a camada `Pipes.Transport.pas`
-  abstrata deixa a porta aberta para um backend FIFO futuro).
+- **Backend Windows (`ptLocal`):** Named Pipes reais (`CreateNamedPipe`/`ConnectNamedPipe`),
+  modo byte (`PIPE_TYPE_BYTE`), sempre com `FILE_FLAG_OVERLAPPED`. Nunca I/O síncrono
+  blocante.
+- **Backend Linux (`ptLocal`):** Unix Domain Sockets (`AF_UNIX`) — equivalente semântico do
+  Named Pipe do Windows. FIFOs (`mkfifo`) estão FORA de escopo (a camada
+  `Pipes.Transport.pas` abstrata deixa a porta aberta para um backend FIFO futuro).
 - **Framing próprio** (length-prefix, header de 20 bytes com magic `NPF1`, kind, corrId,
-  length) idêntico nos dois OS. Não depender de `PIPE_READMODE_MESSAGE`.
+  length) idêntico em todos os transportes (`ptLocal`/`ptTcp`/`ptTls`). Não depender de
+  `PIPE_READMODE_MESSAGE`.
 - **Threading:** cópia renomeada de `AMQP.Threading.pas` (do projeto
   `..\pascal-amqp-faa\src\`) como `Pipes.Threading.pas` — prefixos `TPipe*`/`Pipe*`.
   Sem dependência entre repositórios.
+- **Backend `ptTcp`:** socket TCP nos dois OS, keepalive ligado por padrão
+  (`KeepAliveSeconds`). Adicionado depois do M8 para o caso de PDVs de loja sobre VPN
+  (ver `docs/ARQUITETURA.md`, "Milestones posteriores").
+- **Backend `ptTls`:** TCP + TLS via `Pipes.Transport.Tls.pas`, fachada neutra que delega
+  a `Pipes.Transport.Schannel.pas` (Windows, SSPI nativo) ou `Pipes.Transport.OpenSSL.pas`
+  (POSIX e Windows opt-in), com mTLS suportado nos dois backends. Milestones T0-T5 em
+  `docs/ARQUITETURA.md`.
 
 ## Restrições obrigatórias de código (compat dual Delphi/FPC)
 
@@ -42,10 +59,15 @@ implementar qualquer milestone.
 3. Contador atômico `FInFlight` por conexão + `DrainInFlight` antes de liberar qualquer
    objeto referenciado por callbacks em voo.
 4. Interrupção de leitura blocante:
-   - Windows: `ReadFile`/`ConnectNamedPipe` overlapped + `WaitForMultipleObjects([hIo,
-     hStop])`; Stop = `SetEvent(hStop)` → `CancelIoEx` → fechar handle → `WaitFor` da thread.
-   - Linux: `fpPoll([fd, fdStopSelfPipe])`; Stop = escrever no self-pipe → `fpShutdown` →
-     `fpClose` → `WaitFor`. Escrever sempre com `MSG_NOSIGNAL` (SIGPIPE mata o processo).
+   - Windows (`ptLocal`): `ReadFile`/`ConnectNamedPipe` overlapped + `WaitForMultipleObjects
+     ([hIo, hStop])`; Stop = `SetEvent(hStop)` → `CancelIoEx` → fechar handle → `WaitFor`.
+   - Linux (`ptLocal`/`ptTcp`): `fpPoll([fd, fdStopSelfPipe])`; Stop = escrever no self-pipe
+     → `fpShutdown` → `fpClose` → `WaitFor`. Escrever sempre com `MSG_NOSIGNAL` (SIGPIPE mata
+     o processo). Socket TCP reaproveita o mesmo mecanismo (é o mesmo fd que um UDS).
+   - Windows (`ptTcp`): sem Named Pipe overlapped para socket; `WSAEventSelect` associa o
+     socket a um `WSAEVENT`, espera é `WSAWaitForMultipleEvents([hSock, hStop])`.
+   - `ptTls`: reaproveita a interrupção do TCP de baixo — abortar o endpoint TCP propaga
+     `EPipeClosed` através da decifragem, sem estado próprio a desarmar no adaptador TLS.
 5. Encerramento: sinalizar todos → join de todos → drenar in-flight → liberar. Nunca
    `TerminateThread`. Destructor idempotente chama Stop/Disconnect.
 6. `pdmMainThread` usa `TThread.Queue` (nunca `Synchronize` a partir do reader) com
@@ -53,24 +75,33 @@ implementar qualquer milestone.
 
 ## API pública (resumo)
 
-`TPipeBase` (abstrata: Address, Active, DispatchMode, MaxMessageSize, OnMessage,
-OnError) → `TPipeServer` (Listen, Stop, SendBytes/SendText por ConnId, Broadcast,
-DisconnectClient, OnClientConnected/Disconnected, OnRequest) e `TPipeClient`
-(Connect, Disconnect, SendBytes/SendText, Request/RequestText síncrono com timeout,
-AutoReconnect, OnConnected/OnDisconnected). Assinaturas completas em `docs/ARQUITETURA.md`.
+`TPipeBase` (abstrata: Address, Transport, TlsOptions, KeepAliveSeconds, Active,
+DispatchMode, MaxMessageSize, OnMessage, OnError) → `TPipeServer` (Listen, Stop,
+SendBytes/SendText por ConnId, Broadcast, DisconnectClient, ClientCount/ClientIds
+(só conexões estabelecidas), TryClientIdentity (identidade do par mTLS), MaxClients,
+OnClientConnected/Disconnected, OnRequest) e `TPipeClient` (Connect, Disconnect,
+SendBytes/SendText, Request/RequestText síncrono com timeout, AutoReconnect,
+MaxReconnectAttempts, OnConnected/OnDisconnected). Assinaturas completas e exemplos em
+`README.md`; racional de design em `docs/ARQUITETURA.md`.
 
 `TPipeDispatchMode`: `pdmPool` (padrão), `pdmSerialized` (pool de 1 worker, ordem FIFO),
 `pdmMainThread` (TThread.Queue — apps VCL/LCL).
 
+`TPipeTransportKind`: `ptLocal` (padrão, Named Pipe/UDS), `ptTcp`, `ptTls` (mTLS opcional
+via `TlsOptions`).
+
 ## Estrutura de units
 
 ```
-src/pipes.inc                    src/Pipes.Threading.pas   src/Pipes.Types.pas
-src/Pipes.Framing.pas            src/Pipes.Transport.pas
+src/pipes.inc                    src/Pipes.Threading.pas       src/Pipes.Types.pas
+src/Pipes.Base.pas                src/Pipes.Framing.pas         src/Pipes.Transport.pas
 src/Pipes.Transport.Windows.pas  src/Pipes.Transport.Posix.pas
+src/Pipes.Transport.Tcp.pas      src/Pipes.Transport.Tls.pas
+src/Pipes.Transport.Schannel.pas src/Pipes.Transport.OpenSSL.pas
 src/Pipes.Client.pas             src/Pipes.Server.pas
-tests/Unit + tests/Integration (DUnit e fpcunit, layout espelhado do pascal-amqp-faa)
-samples/  docs/ARQUITETURA.md
+tests/Unit (Threading/Framing/Address) + tests/Integration (Transport/EndToEnd/Stress/Tls)
+  — DUnit e fpcunit, layout espelhado do pascal-amqp-faa
+samples/ (10 amostras — ver README.md)  docs/ARQUITETURA.md  README.md
 Pipes.groupproj (grupo Delphi) + Pipes.lpg (grupo Lazarus) na raiz
 ```
 
@@ -80,22 +111,30 @@ raiz: `Pipes.groupproj` (Projects + Targets + CallTarget de Build/Clean/Make) e
 
 ## Milestones e agente recomendado (economia de tokens)
 
-| # | Milestone | Agente |
-|---|-----------|--------|
-| M0 | Bootstrap (git, pastas, pipes.inc, projetos de teste compilando) | haiku |
-| M1 | Pipes.Threading.pas (cópia/rename) + testes de fumaça | haiku + revisão sonnet |
-| M2 | Pipes.Types + Pipes.Framing + testes unitários | sonnet |
-| M3 | Transporte Windows (overlapped, CancelIoEx, multi-instância) | opus |
-| M4 | Transporte Linux (UDS, fpPoll, self-pipe) | opus |
-| M5 | Server/Client alto nível (acceptor, readers, dispatch, drain) | opus + revisão fable |
-| M6 | Request-Reply, Broadcast, AutoReconnect, pdmMainThread | sonnet + revisão opus |
-| M7 | Testes de integração (stress de Stop, queda abrupta) dual-OS | sonnet |
-| M8 | Samples (echo console, chat VCL/LCL) + README | haiku |
+Todos os milestones abaixo — M0-M8 (escopo original, `ptLocal`) e T0-T5 (`ptTcp`/`ptTls`,
+detalhados em `docs/ARQUITETURA.md`) — estão **concluídos**. A tabela fica como referência
+de sequenciamento e alocação de agente para o próximo milestone que surgir, não como
+trabalho pendente.
 
-Dependências: M0 → M1 → M2 → (M3 ‖ M4) → M5 → M6 → M7 → M8.
+| # | Milestone | Agente | Status |
+|---|-----------|--------|--------|
+| M0 | Bootstrap (git, pastas, pipes.inc, projetos de teste compilando) | haiku | concluído |
+| M1 | Pipes.Threading.pas (cópia/rename) + testes de fumaça | haiku + revisão sonnet | concluído |
+| M2 | Pipes.Types + Pipes.Framing + testes unitários | sonnet | concluído |
+| M3 | Transporte Windows (overlapped, CancelIoEx, multi-instância) | opus | concluído |
+| M4 | Transporte Linux (UDS, fpPoll, self-pipe) | opus | concluído |
+| M5 | Server/Client alto nível (acceptor, readers, dispatch, drain) | opus + revisão fable | concluído |
+| M6 | Request-Reply, Broadcast, AutoReconnect, pdmMainThread | sonnet + revisão opus | concluído |
+| M7 | Testes de integração (stress de Stop, queda abrupta) dual-OS | sonnet | concluído |
+| M8 | Samples (echo console, chat VCL/LCL) + README | haiku | concluído |
+| T0-T5 | `ptTcp`/`ptTls`, mTLS, samples seguros — ver tabela em `docs/ARQUITETURA.md` §7 | opus/sonnet | concluído |
+
+Dependências: M0 → M1 → M2 → (M3 ‖ M4) → M5 → M6 → M7 → M8 → (T0 → T1 → (T2 ‖ T3) → T4 → T5).
 
 ## Verificação por milestone
 
 Compilar em ambos (dcc64 e fpc) + suíte de testes verde nos dois. M7 exige: Stop durante
 tráfego intenso conclui em < 2s (detector de deadlock) e queda abrupta de cliente dispara
-OnClientDisconnected sem vazar handle/fd.
+OnClientDisconnected sem vazar handle/fd. T4/T5 exigem além disso: certificado de CA
+desconhecida e certificado auto-assinado sob mTLS têm veredito correto e distinto (ver
+`docs/ARQUITETURA.md` §7, nota sobre `VerifyClientChain`) em Schannel e OpenSSL.

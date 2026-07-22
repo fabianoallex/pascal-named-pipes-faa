@@ -45,8 +45,8 @@ unit Pipes.Transport.Tls;
     accept, um unico cliente travado no meio do handshake impediria o servidor
     de aceitar todos os outros.
 
-  Estado: servidor implementado so no Windows (Schannel). No POSIX o lado
-  servidor do OpenSSL ainda falta, e TlsPipeCreateListener recusa. }
+  Estado: servidor implementado nos dois backends (Schannel no Windows,
+  OpenSSL no POSIX e Windows opt-in), com mTLS suportado em ambos. }
 
 interface
 

@@ -1,7 +1,16 @@
-# Arquitetura — Biblioteca Multiplataforma de Named Pipes (v1)
+# Arquitetura — pascal-pipes-faa (racional histórico)
 
-Relatório da proposta arquitetural aprovada em 2026-07-16. O resumo operacional (restrições
-e invariantes) vive em `../CLAUDE.md`; este documento guarda o racional completo.
+Relatório da proposta arquitetural aprovada em 2026-07-16, mantido como registro do
+racional de design (por que UDS e não FIFO, por que framing próprio, por que Schannel
+valida a cadeia manualmente etc.). Chamava-se "Named Pipes (v1)" porque o Named Pipe era
+o único transporte planejado; o projeto e o repositório foram renomeados para
+`pascal-pipes-faa` quando `ptTcp`/`ptTls` (§2.5, §7) deixaram de ser hipótese e viraram
+código (ver `../README.md`, seção "Compatibilidade com a API anterior").
+
+O resumo operacional (restrições e invariantes de threading) vive em `../CLAUDE.md`. O
+**estado atual da API pública** (o que existe hoje, com exemplos) vive em `../README.md` —
+este documento aqui é o "porquê", não o "o que tem hoje"; quando os dois divergirem sobre
+um detalhe de API, o README é a fonte de verdade.
 
 ## 1. Objetivo e escopo
 
@@ -71,9 +80,15 @@ compartilhada fica como refactor futuro se um terceiro projeto precisar.
 
 ## 3. API pública (esqueleto)
 
+> Esqueleto ilustrativo do racional de design — para as assinaturas exatas e todas as
+> propriedades (`Transport`, `TlsOptions`, `KeepAliveSeconds`, identidade de par mTLS etc.),
+> ver `../README.md`, seção "API — resumo".
+
 ```pascal
 type
   TPipeConnectionId = UInt64;  // 0 = inválido; servidor gera sequencial atômico
+
+  TPipeTransportKind = (ptLocal, ptTcp, ptTls);  // §2.5/§7 — Named Pipe/UDS, TCP, TCP+TLS
 
   TPipeMessageEvent    = procedure(Sender: TObject; AConnId: TPipeConnectionId;
                                    const AData: TBytes) of object;
@@ -89,14 +104,20 @@ type
   //  pdmMainThread — TThread.Queue p/ a main thread (VCL/LCL sem Synchronize manual)
   TPipeDispatchMode = (pdmPool, pdmSerialized, pdmMainThread);
 
-  EPipeError   = class(Exception);
-  EPipeTimeout = class(EPipeError);
-  EPipeClosed  = class(EPipeError);
+  EPipeError    = class(Exception);
+  EPipeTimeout  = class(EPipeError);
+  EPipeClosed   = class(EPipeError);
+  EPipeProtocol = class(EPipeError);  // frame corrompido, magic inválido, oversize
+  EPipeTls      = class(EPipeError);  // falha de handshake/validação de certificado
 
   TPipeBase = class abstract
   public
     property Address: string;          // 'meu_app' → Win: \\.\pipe\meu_app
                                         //             Linux: /tmp/meu_app.pipe (configurável)
+                                        //             ptTcp/ptTls: 'host:porta'
+    property Transport: TPipeTransportKind;  // ptLocal (padrão), ptTcp, ptTls — §2.5
+    property TlsOptions: TPipeTlsConfig;     // ignorado fora de ptTls; ver §7 (T0-T5)
+    property KeepAliveSeconds: Cardinal;     // só ptTcp/ptTls; 0 = desligado
     property Active: Boolean;           // read-only
     property DispatchMode: TPipeDispatchMode;
     property MaxMessageSize: Cardinal;  // padrão 16 MB; frame maior = erro de protocolo
@@ -113,9 +134,11 @@ type
     procedure Broadcast(const AData: TBytes);
     procedure BroadcastText(const AText: string);
     procedure DisconnectClient(AConnId: TPipeConnectionId);
-    function  ClientCount: Integer;
+    function  ClientCount: Integer;      // só conexões ESTABELECIDAS (pós-handshake TLS)
     function  ClientIds: TArray<TPipeConnectionId>;
-    property  MaxClients: Integer;      // 0 = ilimitado
+    function  TryClientIdentity(AConnId: TPipeConnectionId;
+                out AIdentity: TPipePeerIdentity): Boolean;  // identidade do certificado mTLS
+    property  MaxClients: Integer;      // 0 = ilimitado; conta a partir do handshake aceito
     property  OnClientConnected: TPipeConnectionEvent;
     property  OnClientDisconnected: TPipeConnectionEvent;
     property  OnRequest: TPipeRequestEvent;  // retorno do handler vira frame reply
@@ -133,6 +156,7 @@ type
     property  Connected: Boolean;
     property  AutoReconnect: Boolean;
     property  ReconnectDelayMs: Cardinal;
+    property  MaxReconnectAttempts: Integer;  // 0 = ilimitado; zera a cada conexão aceita
     property  OnConnected: TPipeConnectionEvent;
     property  OnDisconnected: TPipeConnectionEvent;
   end;
@@ -225,7 +249,35 @@ Todos os handles com `FILE_FLAG_OVERLAPPED`; nenhuma chamada síncrona blocante.
 - **Socket path**: `fpUnlink` antes do `fpBind` (remove socket órfão de crash anterior) e
   no `Stop`.
 
-### 5.3 Encerramento sem congelar a UI
+### 5.3 Interrupção da leitura blocante — TCP e TLS
+
+- **POSIX**: um socket TCP é o mesmo objeto que um UDS a nível de fd — reaproveita
+  integralmente `fpPoll([fd, fdStop])` + self-pipe de §5.2, sem código extra.
+- **Windows**: não há Named Pipe overlapped para socket; `Pipes.Transport.Tcp.pas`
+  implementa o análogo Winsock do padrão `[evento da operação, evento de stop]`:
+  `WSAEventSelect` associa o socket a um `WSAEVENT` e toda espera é um
+  `WSAWaitForMultipleEvents` nesse par. O socket fica não-bloqueante; cada operação tenta
+  `recv`/`send` primeiro e só espera no evento se vier `WSAEWOULDBLOCK` (evita depender da
+  semântica de borda de `FD_READ`/`FD_WRITE`, que só re-sinaliza na transição).
+- **`ptTls`**: `Pipes.Transport.Tls.pas` é a fachada neutra — não implementa TLS, só
+  embrulha o endpoint TCP num `TStream` e delega a um backend por diretiva de compilação:
+  `Pipes.Transport.Schannel.pas` (SSPI, Windows) ou `Pipes.Transport.OpenSSL.pas`
+  (libssl/libcrypto, POSIX e Windows opt-in). Uma leitura presa no TLS está, na prática,
+  presa no `Read` do endpoint TCP de baixo; abortar aquele propaga `EPipeClosed` pela pilha
+  de decifragem — não há estado próprio a desarmar no adaptador TLS.
+- **Handshake do servidor TLS fora do accept**: o listener devolve o endpoint ainda não
+  negociado; quem chama o handshake é a reader thread da própria conexão, não o loop de
+  accept — um cliente lento travado no meio do handshake não impede o servidor de aceitar
+  os demais. `HandshakeTimeoutMs` limita esse handshake (0 = padrão da lib; ver
+  `PIPE_TLS_HANDSHAKE_NO_TIMEOUT` para desligar).
+- **mTLS**: servidor implementado nos dois backends — OpenSSL (`SSL_VERIFY_PEER` +
+  `FAIL_IF_NO_PEER_CERT`) recusa a conexão dentro do handshake; Schannel completa o
+  handshake e só depois valida a cadeia manualmente (§7, nota sobre `VerifyClientChain`),
+  então a recusa acontece um passo depois — diferença de comportamento observável que a
+  aplicação não deve assumir como idêntica entre plataformas (detalhado em
+  `../README.md`, seção sobre mTLS).
+
+### 5.4 Encerramento sem congelar a UI
 
 - `Stop`/`Disconnect`/destructor: sinalizar todos → join de todos → `DrainInFlight` →
   liberar. Nunca `TerminateThread`/`KillThread`. Destructor idempotente chama Stop.
@@ -241,34 +293,39 @@ Todos os handles com `FILE_FLAG_OVERLAPPED`; nenhuma chamada síncrona blocante.
 |------|----------|
 | `src/pipes.inc` | diretivas duais (molde `amqp.inc`) |
 | `src/Pipes.Threading.pas` | cópia renomeada de `AMQP.Threading.pas` |
-| `src/Pipes.Types.pas` | `TPipeConnectionId`, eventos, exceções, `TPipeDispatchMode` |
+| `src/Pipes.Types.pas` | `TPipeConnectionId`, eventos, exceções, `TPipeDispatchMode`, `TPipeTransportKind`, `TPipePeerIdentity`, constantes de keepalive |
 | `src/Pipes.Framing.pas` | encode/decode do frame, helpers UTF-8 |
 | `src/Pipes.Transport.pas` | `TPipeEndpoint`/`TPipeListener` abstratos (Read/Write/Accept interrompíveis + CloseAbort) |
 | `src/Pipes.Transport.Windows.pas` | Named Pipe overlapped (`{$IFDEF PIPES_WINDOWS}`) |
 | `src/Pipes.Transport.Posix.pas` | UDS + fpPoll + self-pipe (`{$IFDEF PIPES_POSIX}`) |
-| `src/Pipes.Transport.Tcp.pas` | socket TCP nos dois OS (`ptTcp`), keepalive |
-| `src/Pipes.Transport.Tls.pas` | fachada `ptTls`: embrulha um endpoint TCP numa sessão TLS |
-| `src/Pipes.Transport.Schannel.pas` | backend TLS via SSPI (`{$IFDEF PIPES_SCHANNEL}`) |
-| `src/Pipes.Transport.OpenSSL.pas` | backend TLS via OpenSSL (`{$IFDEF PIPES_OPENSSL}`) |
-| `src/Pipes.Server.pas` | `TPipeServer` + acceptor + conexões |
-| `src/Pipes.Client.pas` | `TPipeClient` + reconexão |
-| `tests/Unit`, `tests/Integration` | DUnit (Delphi) + fpcunit (FPC), layout espelhado do pascal-amqp-faa |
+| `src/Pipes.Transport.Tcp.pas` | socket TCP nos dois OS (`ptTcp`), keepalive (§5.3) |
+| `src/Pipes.Transport.Tls.pas` | fachada neutra `ptTls`: embrulha um endpoint TCP numa sessão TLS, escolhe o backend por diretiva (§5.3) |
+| `src/Pipes.Transport.Schannel.pas` | backend TLS via SSPI (`{$IFDEF PIPES_SCHANNEL}`), cliente e servidor, validação manual de cadeia (§7) |
+| `src/Pipes.Transport.OpenSSL.pas` | backend TLS via OpenSSL (`{$IFDEF PIPES_OPENSSL}`), cliente e servidor, mTLS |
+| `src/Pipes.Base.pas` | `TPipeBase` (Address/Transport/TlsOptions/KeepAliveSeconds/DispatchMode), `TPipeTlsConfig`, `TPipeGuard` |
+| `src/Pipes.Server.pas` | `TPipeServer` + acceptor + conexões + identidade de par mTLS |
+| `src/Pipes.Client.pas` | `TPipeClient` + reconexão + `MaxReconnectAttempts` |
+| `tests/Unit/` (`Pipes.ThreadingTests`, `Pipes.FramingTests`, `Pipes.AddressTests`) | unitários; DUnit (Delphi) + fpcunit (FPC, em `fpc/`), layout espelhado do pascal-amqp-faa |
+| `tests/Integration/` (`Pipes.TransportTests`, `Pipes.EndToEndTests`, `Pipes.StressTests`, `Pipes.TlsTests`) | integração dual-OS, inclui mTLS; mesmo espelhamento DUnit/fpcunit |
 | `tests/pki/` | PKI de **teste** versionada (sem valor de segurança; ver `LEIA-ME.md`) |
-| `samples/` | echo console; chat VCL/LCL |
+| `samples/` | 10 amostras (echo, chat, PDV, fila de impressão, RPC concorrente etc.) — ver `../README.md`, seção de samples |
 
 ## 7. Milestones
 
-| # | Milestone | Conteúdo | Agente recomendado |
-|---|-----------|----------|--------------------|
-| M0 | Bootstrap | git init, pastas, `pipes.inc`, `.gitignore`, projetos de teste compilando vazios | haiku |
-| M1 | Threading | cópia/rename de `AMQP.Threading.pas` + testes de fumaça (pool, monitor, atomics) | haiku + revisão sonnet |
-| M2 | Framing | `Pipes.Types` + `Pipes.Framing` + testes unitários (roundtrip, magic inválido, oversize, UTF-8) | sonnet |
-| M3 | Transporte Windows | `Pipes.Transport` abstrato + implementação overlapped completa | opus |
-| M4 | Transporte Linux | UDS, fpPoll, self-pipe, MSG_NOSIGNAL, unlink | opus |
-| M5 | Alto nível | Server/Client, acceptor, readers, dispatch, DrainInFlight, Stop/Disconnect | opus + revisão fable |
-| M6 | Avançados | Request-Reply, Broadcast, AutoReconnect, pdmMainThread + guarda | sonnet + revisão opus |
-| M7 | Integração | echo, N clientes concorrentes, queda abrupta, stress de Stop sob tráfego — dois OS | sonnet |
-| M8 | Samples/docs | echo console + chat VCL/LCL + README | haiku |
+Todos os milestones abaixo (M0-M8 e T0-T5) estão **concluídos**; a tabela fica como
+registro histórico do sequenciamento e da alocação de agente, não como plano em aberto.
+
+| # | Milestone | Conteúdo | Agente recomendado | Status |
+|---|-----------|----------|--------------------|--------|
+| M0 | Bootstrap | git init, pastas, `pipes.inc`, `.gitignore`, projetos de teste compilando vazios | haiku | concluído |
+| M1 | Threading | cópia/rename de `AMQP.Threading.pas` + testes de fumaça (pool, monitor, atomics) | haiku + revisão sonnet | concluído |
+| M2 | Framing | `Pipes.Types` + `Pipes.Framing` + testes unitários (roundtrip, magic inválido, oversize, UTF-8) | sonnet | concluído |
+| M3 | Transporte Windows | `Pipes.Transport` abstrato + implementação overlapped completa | opus | concluído |
+| M4 | Transporte Linux | UDS, fpPoll, self-pipe, MSG_NOSIGNAL, unlink | opus | concluído |
+| M5 | Alto nível | Server/Client, acceptor, readers, dispatch, DrainInFlight, Stop/Disconnect | opus + revisão fable | concluído |
+| M6 | Avançados | Request-Reply, Broadcast, AutoReconnect, pdmMainThread + guarda | sonnet + revisão opus | concluído |
+| M7 | Integração | echo, N clientes concorrentes, queda abrupta, stress de Stop sob tráfego — dois OS | sonnet | concluído |
+| M8 | Samples/docs | echo console + chat VCL/LCL + README | haiku | concluído |
 
 ### Milestones posteriores (fora do plano original)
 
@@ -277,14 +334,14 @@ conversando com a retaguarda sobre VPN — cenário em que "IPC local" deixa de 
 aparecem dois problemas que o desenho original não tinha: conexão ociosa morrendo em
 silêncio (keepalive) e listener exposto sem controle de acesso do SO (TLS/mTLS).
 
-| # | Milestone | Conteúdo |
-|---|-----------|----------|
-| T0 | Base TLS | adaptador `TPipeEndpoint`⇄`TStream`, cliente TLS |
-| T1 | Handshake fora do accept | negociação na reader thread da conexão, não no loop de accept |
-| T2 | Servidor Schannel | `AcceptSecurityContext`, credencial INBOUND, PFX |
-| T3 | Servidor OpenSSL | equivalente no POSIX |
-| T4 | mTLS | OpenSSL (`SSL_VERIFY_PEER` + `FAIL_IF_NO_PEER_CERT`) e Schannel (validação manual da cadeia) |
-| T5 | `ptTls` na API pública | enum, `TlsOptions`, timeout de handshake, suíte e docs |
+| # | Milestone | Conteúdo | Status |
+|---|-----------|----------|--------|
+| T0 | Base TLS | adaptador `TPipeEndpoint`⇄`TStream`, cliente TLS | concluído |
+| T1 | Handshake fora do accept | negociação na reader thread da conexão, não no loop de accept | concluído |
+| T2 | Servidor Schannel | `AcceptSecurityContext`, credencial INBOUND, PFX | concluído |
+| T3 | Servidor OpenSSL | equivalente no POSIX | concluído |
+| T4 | mTLS | OpenSSL (`SSL_VERIFY_PEER` + `FAIL_IF_NO_PEER_CERT`) e Schannel (validação manual da cadeia) | concluído |
+| T5 | `ptTls` na API pública | enum, `TlsOptions`, timeout de handshake, suíte e docs | concluído |
 
 **Por que a validação de cadeia do Schannel é manual.** `hRootStore` +
 `ASC_REQ_MUTUAL_AUTH` **não** validam a cadeia do cliente: o Schannel apenas *exige* que

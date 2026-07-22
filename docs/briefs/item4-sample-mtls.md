@@ -1,3 +1,7 @@
+> **Status: concluído.** Sample `samples/EchoSeguro/` (Server+Client, `.dproj`/`.lpi`)
+> existe e está registrado nos grupos de build; descrito em `README.md`. Mantido como
+> registro do racional de fiação TLS/mTLS do sample.
+
 # Brief: sample de echo seguro (ptTls + mTLS)
 
 **Modelo sugerido:** haiku (sample/wiring, milestone M8).

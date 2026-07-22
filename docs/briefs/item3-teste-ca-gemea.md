@@ -1,3 +1,8 @@
+> **Status: concluído.** `Mtls_ClienteDeCaGemea_Recusado` existe em
+> `tests/Integration/Pipes.TlsTests.pas` e no espelho `fpc/`; fixtures `gemea_*`
+> versionados em `tests/pki/` e documentados em `tests/pki/LEIA-ME.md`. Mantido como
+> registro do racional (por que o teste existe e por que passa trivialmente no Windows).
+
 # Brief: teste da CA gêmea (guarda de fronteira do mTLS SChannel)
 
 **Modelo sugerido:** sonnet (teste, segue padrão existente).
